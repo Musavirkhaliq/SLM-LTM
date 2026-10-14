@@ -179,7 +179,7 @@ services:
     expose: ["4317", "4318", "8888", "8889", "13133"]
 
   prometheus:
-    image: prom/prometheus:v2.55.1
+    image: prom/prometheus:v3.15.0
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
