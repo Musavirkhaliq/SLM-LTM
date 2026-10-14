@@ -1,0 +1,92 @@
+# Alert rules for docker compose / plain Prometheus. The Helm chart renders the same rules
+# (thresholds from values) in templates/prometheusrule.yaml; keep both in sync.
+#
+# Metric assumptions (verify against your build):
+#   gateway/control-plane: slm_http_requests_total{service,method,route,status}, slm_http_request_duration_seconds_bucket
+#                          (slm_common.telemetry.MetricsMiddleware)
+#   vLLM:                  vllm:num_requests_waiting, vllm:gpu_cache_usage_perc (vllm >= 0.11: vllm:kv_cache_usage_perc),
+#                          vllm:time_to_first_token_seconds_bucket, vllm:e2e_request_latency_seconds_bucket
+#   GPU:                   DCGM_FI_DEV_GPU_UTIL, DCGM_FI_DEV_FB_USED, DCGM_FI_DEV_FB_FREE (dcgm-exporter)
+groups:
+  - name: slm-studio.recording
+    interval: 30s
+    rules:
+      # Per-pod rate, consumed by the gateway HPA through prometheus-adapter (metric: slm_http_requests_per_second).
+      # (namespace/pod labels exist only on Kubernetes scrapes.)
+      - record: slm:http_requests_per_second:rate2m
+        expr: sum by (namespace, pod, service) (rate(slm_http_requests_total[2m]))
+      - record: slm:gateway_error_ratio:rate5m
+        expr: |
+          sum(rate(slm_http_requests_total{service="gateway",status=~"5.."}[5m]))
+          / clamp_min(sum(rate(slm_http_requests_total{service="gateway"}[5m])), 1e-9)
+
+  - name: slm-studio.alerts
+    rules:
+      - alert: SLMHighErrorRate
+        expr: |
+          slm:gateway_error_ratio:rate5m > 0.05
+          and sum(rate(slm_http_requests_total{service="gateway"}[5m])) > 0.05
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Gateway 5xx ratio above 5% for 5 minutes"
+          description: "{{ $value | humanizePercentage }} of gateway requests are failing."
+
+      - alert: SLMGatewayLatencyP95High
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(slm_http_request_duration_seconds_bucket{service="gateway"}[5m]))) > 30
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Gateway p95 latency above 30s"
+          description: "p95 end-to-end gateway latency is {{ $value | humanizeDuration }}."
+
+      - alert: SLMvLLMTimeToFirstTokenHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le, slm_deployment) (rate(vllm:time_to_first_token_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 time-to-first-token above 2s on {{ $labels.slm_deployment }}"
+          description: "Queueing or prefill saturation. Check waiting requests and KV cache usage."
+
+      - alert: SLMvLLMQueueBacklog
+        expr: sum by (slm_deployment) (vllm:num_requests_waiting) > 20
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.slm_deployment }} has {{ $value }} waiting requests"
+          description: "Scale replicas or raise max_num_seqs."
+
+      - alert: SLMvLLMKVCacheSaturated
+        expr: max by (slm_deployment) (vllm:gpu_cache_usage_perc or vllm:kv_cache_usage_perc) > 0.95
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "KV cache above 95% on {{ $labels.slm_deployment }}"
+          description: "Requests will be preempted; reduce max_model_len/max_num_seqs or add capacity."
+
+      - alert: SLMGPUUtilizationSaturated
+        expr: avg by (Hostname, gpu) (avg_over_time(DCGM_FI_DEV_GPU_UTIL[15m])) > 95
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.Hostname }} saturated"
+          description: "15m average utilisation is {{ $value | printf \"%.0f\" }}%."
+
+      - alert: SLMGPUMemoryHigh
+        expr: |
+          100 * DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) > 95
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "GPU {{ $labels.gpu }} memory above 95% on {{ $labels.Hostname }}"
+          description: "Risk of OOM; lower gpu_memory_utilization or move a model."
+
+      - alert: SLMServiceDown
+        expr: up{job="slm-services"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.slm_service }} is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }}."

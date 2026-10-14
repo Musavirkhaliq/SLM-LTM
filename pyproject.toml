@@ -1,0 +1,52 @@
+[project]
+name = "slm-studio"
+version = "0.1.0"
+description = "Multi-tenant SLM-as-a-service platform on vLLM"
+requires-python = ">=3.11"
+dependencies = ["asyncpg>=0.29"]
+
+[tool.uv.workspace]
+members = ["services/*"]
+
+[tool.uv.sources]
+slm-common = { workspace = true }
+slm-auth = { workspace = true }
+slm-registry = { workspace = true }
+slm-gateway = { workspace = true }
+slm-finetune = { workspace = true }
+slm-rag = { workspace = true }
+slm-evaluation = { workspace = true }
+slm-deployment = { workspace = true }
+slm-monitoring = { workspace = true }
+slm-cost = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.27",
+  "pgserver>=0.1.4",
+  "ruff>=0.6",
+  "fakeredis[lua]>=2.39.0",
+  "asgi-lifespan>=2.1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["services"]
+pythonpath = ["db", "services/gateway/tests"]
+addopts = "-ra --import-mode=importlib --show-capture=no"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["web", "deploy"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
+ignore = ["S101", "B008", "RUF012", "RUF029", "S608"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S105", "S106", "S311", "E501", "RUF001"]
+"db/**" = ["S608"]

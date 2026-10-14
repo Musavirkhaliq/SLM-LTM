@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1.9
+#
+# Fine-tuning image (Unsloth + PEFT + TRL + transformers). Launched as a Kubernetes Job by the
+# finetune service, requesting nvidia.com/gpu.
+#
+#   docker build -f deploy/docker/Dockerfile.trainer -t slm-studio/trainer:dev .
+#
+# DGX Spark (GB10 / Blackwell, aarch64): the CUDA 12.8 default below works with cu128 wheels; if a
+# wheel is missing for your arch/driver, build on NVIDIA's container instead:
+#   --build-arg BASE_IMAGE=nvcr.io/nvidia/pytorch:25.09-py3 --build-arg USE_SYSTEM_TORCH=1
+# (Not verified on hardware from this repo; see deploy/docker/README.md.)
+ARG CUDA_VERSION=12.8.1
+ARG UBUNTU_VERSION=24.04
+ARG UV_VERSION=0.11.11
+ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION}
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+# ---- builder: resolve + install the Python environment
+FROM ${BASE_IMAGE} AS builder
+ARG USE_SYSTEM_TORCH=0
+COPY --from=uv /uv /uvx /bin/
+ENV DEBIAN_FRONTEND=noninteractive \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv python3-dev gcc libc6-dev git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY deploy/docker/trainer/requirements.txt /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "${USE_SYSTEM_TORCH}" = "1" ]; then \
+        uv venv --system-site-packages /opt/venv --python /usr/bin/python3 ; \
+    else \
+        uv venv /opt/venv --python /usr/bin/python3 ; \
+    fi \
+ && . /opt/venv/bin/activate \
+ && uv pip install --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        -r /tmp/requirements.txt
+
+# ---- runtime
+FROM ${BASE_IMAGE} AS runtime
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG SOURCE=https://github.com/your-org/slm-studio
+LABEL org.opencontainers.image.title="slm-studio-trainer" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="${SOURCE}"
+
+ENV DEBIAN_FRONTEND=noninteractive
+# gcc + python headers are required at run time: Triton (used by Unsloth kernels) JIT-compiles launchers.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-dev gcc libc6-dev ca-certificates tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 trainer \
+ && useradd  --system --uid 10001 --gid 10001 --no-create-home --home-dir /work --shell /usr/sbin/nologin trainer \
+ && mkdir -p /work && chown 10001:10001 /work
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --chown=10001:10001 deploy/docker/trainer/train.py /app/train.py
+
+# /work is the only writable path besides /tmp and /dev/shm (the Job mounts emptyDirs there).
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/work \
+    HF_HOME=/work/hf \
+    TRITON_CACHE_DIR=/work/triton \
+    TORCHINDUCTOR_CACHE_DIR=/work/inductor \
+    UNSLOTH_COMPILE_LOCATION=/work/unsloth_cache \
+    TOKENIZERS_PARALLELISM=false \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    DO_NOT_TRACK=1 \
+    SLM_TRAINER_WORKDIR=/work
+
+WORKDIR /work
+USER 10001:10001
+
+# Job spec: JSON in $SLM_JOB_SPEC (or a file path in $SLM_JOB_SPEC_FILE). See train.py docstring.
+# Exit codes: 0 ok | 1 training failed (reported) | 2 invalid spec (non-retryable) | 143 SIGTERM (checkpointed).
+ENTRYPOINT ["/usr/bin/tini", "--", "python", "/app/train.py"]

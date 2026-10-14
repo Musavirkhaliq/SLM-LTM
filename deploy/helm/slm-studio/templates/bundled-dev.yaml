@@ -1,0 +1,200 @@
+{{- /*
+  DEV / DEMO ONLY: in-cluster Postgres 16 and Redis 7 (single replica, no backups, no HA).
+  Production: use managed/operator-run Postgres (e.g. CloudNativePG, RDS, Azure Flexible Server) and Redis, and put their
+  DSNs in the external secret store. Postgres is bootstrapped with files/postgres-init.sh (roles slm_migrator / slm_app).
+*/ -}}
+{{- $fn := include "slm.fullname" . }}
+{{- if .Values.postgresql.bundled.enabled }}
+{{- $pg := .Values.postgresql.bundled }}
+{{- $name := printf "%s-postgresql" $fn }}
+{{- $sel := dict "app.kubernetes.io/name" (include "slm.name" .) "app.kubernetes.io/instance" .Release.Name "app.kubernetes.io/component" "postgresql" }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-auth
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "postgresql" "tier" "infra") | nindent 4 }}
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: {{ required "postgresql.bundled.auth.postgresPassword is required" $pg.auth.postgresPassword | quote }}
+  SLM_MIGRATOR_DB_PASSWORD: {{ required "postgresql.bundled.auth.migratorPassword is required" $pg.auth.migratorPassword | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-init
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "postgresql" "tier" "infra") | nindent 4 }}
+data:
+  10-slm-init.sh: |
+    {{- .Files.Get "files/postgres-init.sh" | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "postgresql" "tier" "infra") | nindent 4 }}
+spec:
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+  selector:
+    {{- toYaml $sel | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "postgresql" "tier" "infra") | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ $name }}
+  selector:
+    matchLabels:
+      {{- toYaml $sel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slm.componentLabels" (dict "root" . "component" "postgresql" "tier" "infra") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70          # postgres user in the alpine image
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          image: {{ $pg.image | quote }}
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          env:
+            - { name: POSTGRES_USER, value: postgres }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          envFrom:
+            - secretRef:
+                name: {{ $name }}-auth
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U postgres -d slm"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U postgres"]
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: run, mountPath: /var/run/postgresql }
+            - { name: tmp, mountPath: /tmp }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true }
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: init
+          configMap:
+            name: {{ $name }}-init
+            defaultMode: 365          # 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $pg.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $pg.storageSize }}
+{{- end }}
+{{- if .Values.redis.bundled.enabled }}
+{{- $rd := .Values.redis.bundled }}
+{{- $name := printf "%s-redis" $fn }}
+{{- $sel := dict "app.kubernetes.io/name" (include "slm.name" .) "app.kubernetes.io/instance" .Release.Name "app.kubernetes.io/component" "redis" }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-auth
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "redis" "tier" "infra") | nindent 4 }}
+type: Opaque
+stringData:
+  REDIS_PASSWORD: {{ required "redis.bundled.password is required" $rd.password | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "redis" "tier" "infra") | nindent 4 }}
+spec:
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }
+  selector:
+    {{- toYaml $sel | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "redis" "tier" "infra") | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ $name }}
+  selector:
+    matchLabels:
+      {{- toYaml $sel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slm.componentLabels" (dict "root" . "component" "redis" "tier" "infra") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: redis
+          image: {{ $rd.image | quote }}
+          command: ["sh", "-c", "exec redis-server --requirepass \"$REDIS_PASSWORD\" --appendonly yes --dir /data --maxmemory-policy noeviction"]
+          ports:
+            - { name: redis, containerPort: 6379 }
+          envFrom:
+            - secretRef:
+                name: {{ $name }}-auth
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli --no-auth-warning -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli --no-auth-warning -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+            periodSeconds: 20
+          resources:
+            {{- toYaml $rd.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $rd.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $rd.storageSize }}
+{{- end }}

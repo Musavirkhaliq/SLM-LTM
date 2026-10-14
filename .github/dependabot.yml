@@ -1,0 +1,57 @@
+version: 2
+
+# NOTE: Dependabot's docker ecosystem cannot resolve `FROM image:${ARG}` (the pinned base images live in ARG defaults
+# of deploy/docker/Dockerfile.*). It still bumps literal image references (mlflow image, compose files); for the ARG
+# pins use Renovate's regex manager or review them with the scheduled Trivy scans.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      python-minor-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(py)"
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      web-minor-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(web)"
+
+  - package-ecosystem: docker
+    directories:
+      - /deploy/docker
+    schedule:
+      interval: weekly
+      day: tuesday
+    commit-message:
+      prefix: "deps(docker)"
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+    commit-message:
+      prefix: "deps(compose)"

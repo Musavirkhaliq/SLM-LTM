@@ -1,0 +1,17 @@
+[project]
+name = "slm-evaluation"
+version = "0.1.0"
+description = "SLM Studio evaluation service"
+requires-python = ">=3.11"
+dependencies = [
+  "slm-common",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slm_evaluation"]

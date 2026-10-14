@@ -1,0 +1,131 @@
+{{- /*
+  Schema migration as a Helm hook (pre-install, pre-upgrade). Runs db/migrate.py from a service image
+  with the OWNER role; services themselves only ever get the non-owner slm_app DSN. migrate.py creates slm_app
+  from SLM_APP_PASSWORD when it does not exist.
+  Ordering: SA + secret (weight -10) -> Job (weight 0). The Job pod simply waits (ContainerCreating) until
+  External Secrets has materialised the Secret.
+  Note: on first install NetworkPolicies do not exist yet; on upgrades the Job is allowed to reach Postgres
+  through the `slm-studio.io/egress: external` label.
+*/ -}}
+{{- if .Values.migration.enabled }}
+{{- $svcCfg := get .Values.services .Values.migration.service }}
+{{- $name := printf "%s-migrate" (include "slm.fullname" .) }}
+{{- /* With the bundled (in-release) Postgres the DB does not exist before install, so run after it. */ -}}
+{{- $events := ternary "post-install,pre-upgrade" "pre-install,pre-upgrade" .Values.postgresql.bundled.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "migrate" "tier" "migration") | nindent 4 }}
+  annotations:
+    {{- include "slm.hookAnnotations" (dict "weight" "-10" "events" $events) | nindent 4 }}
+automountServiceAccountToken: false
+{{- if not .Values.migration.existingSecret }}
+{{- if .Values.secrets.externalSecret.enabled }}
+---
+apiVersion: {{ .Values.secrets.externalSecret.apiVersion }}
+kind: ExternalSecret
+metadata:
+  name: {{ include "slm.migrateSecretName" . }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "migrate" "tier" "migration") | nindent 4 }}
+  annotations:
+    {{- include "slm.hookAnnotations" (dict "weight" "-10" "events" $events) | nindent 4 }}
+spec:
+  refreshInterval: {{ .Values.secrets.externalSecret.refreshInterval }}
+  secretStoreRef:
+    {{- toYaml .Values.secrets.externalSecret.secretStoreRef | nindent 4 }}
+  target:
+    name: {{ include "slm.migrateSecretName" . }}
+    creationPolicy: Owner
+  data:
+    {{- range $key, $ref := .Values.migration.externalSecret.data }}
+    - secretKey: {{ $key }}
+      remoteRef:
+        key: {{ $ref.key }}
+        {{- with $ref.property }}
+        property: {{ . }}
+        {{- end }}
+    {{- end }}
+{{- else if or .Values.secrets.create .Values.postgresql.bundled.enabled }}
+{{- $data := deepCopy .Values.migration.createValues }}
+{{- if .Values.postgresql.bundled.enabled }}
+{{- if not (hasKey $data "SLM_MIGRATE_DATABASE_URL") }}
+{{- $_ := set $data "SLM_MIGRATE_DATABASE_URL" (printf "postgresql://slm_migrator:%s@%s-postgresql:5432/slm" (required "postgresql.bundled.auth.migratorPassword is required" .Values.postgresql.bundled.auth.migratorPassword) (include "slm.fullname" .)) }}
+{{- end }}
+{{- if not (hasKey $data "SLM_APP_PASSWORD") }}
+{{- $_ := set $data "SLM_APP_PASSWORD" (required "postgresql.bundled.auth.appPassword is required" .Values.postgresql.bundled.auth.appPassword) }}
+{{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "slm.migrateSecretName" . }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "migrate" "tier" "migration") | nindent 4 }}
+  annotations:
+    {{- include "slm.hookAnnotations" (dict "weight" "-10" "events" $events) | nindent 4 }}
+type: Opaque
+stringData:
+  {{- toYaml $data | nindent 2 }}
+{{- end }}
+{{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "migrate" "tier" "migration") | nindent 4 }}
+  annotations:
+    {{- include "slm.hookAnnotations" (dict "weight" "0" "events" $events "deletePolicy" "before-hook-creation,hook-succeeded") | nindent 4 }}
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit | int }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds | int }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "slm.componentLabels" (dict "root" . "component" "migrate" "tier" "migration") | nindent 8 }}
+        slm-studio.io/egress: external
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      {{- include "slm.pullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "slm.image" (dict "root" . "image" $svcCfg.image "name" .Values.migration.service) | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["python", "/app/db/migrate.py"]
+          env:
+            - name: SLM_MIGRATE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slm.migrateSecretName" . }}
+                  key: SLM_MIGRATE_DATABASE_URL
+            - name: SLM_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slm.migrateSecretName" . }}
+                  key: SLM_APP_PASSWORD
+                  optional: true
+            - name: SLM_ENV
+              value: {{ .Values.config.SLM_ENV | quote }}
+            - name: HOME
+              value: /tmp
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

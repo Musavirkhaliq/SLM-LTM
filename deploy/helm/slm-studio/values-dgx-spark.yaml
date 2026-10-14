@@ -1,0 +1,102 @@
+# Overlay for a single NVIDIA DGX Spark (GB10 Grace-Blackwell, aarch64, 128 GB unified memory) running a
+# single-node Kubernetes (k3s/kubeadm) with the NVIDIA GPU Operator.
+#
+#   helm upgrade --install slm-studio deploy/helm/slm-studio -n slm-studio --create-namespace \
+#     -f deploy/helm/slm-studio/values-dgx-spark.yaml \
+#     --set global.imageRepositoryPrefix=<org>/slm-studio --set global.imageTag=<tag>
+#
+# Prerequisites created by you (no External Secrets Operator assumed on a single box):
+#   kubectl -n slm-studio create secret generic slm-studio-secrets \
+#     --from-literal=SLM_DATABASE_URL=... --from-literal=SLM_REDIS_URL=... --from-file=SLM_JWT_PRIVATE_KEY=... \
+#     --from-file=SLM_JWT_PUBLIC_KEY=... --from-literal=SLM_S3_ACCESS_KEY=... --from-literal=SLM_S3_SECRET_KEY=... \
+#     --from-literal=SLM_TRAINER_TOKEN=...
+#   kubectl -n slm-studio create secret generic slm-studio-migrate --from-literal=SLM_DATABASE_URL=<slm_migrator DSN>
+# or enable the bundled Postgres/Redis below and pass the passwords with --set (dev/PoC only).
+#
+# GPU sharing: the Spark has ONE GPU. To run several models side by side, enable NVIDIA device-plugin time-slicing
+# (advertise e.g. 4 x nvidia.com/gpu) and keep the sum of gpuMemoryUtilization below ~0.85 because CPU and GPU share
+# the same 128 GB. Values here are starting points, not measured.
+
+scheduling:
+  podAntiAffinity: none          # one node: spreading is meaningless
+  topologySpread: []
+
+secrets:
+  existingSecret: slm-studio-secrets
+  externalSecret:
+    enabled: false
+
+migration:
+  existingSecret: slm-studio-migrate
+
+config:
+  SLM_ENV: prod
+  SLM_S3_ENDPOINT: http://minio.storage.svc.cluster.local:9000    # run MinIO on the box (separate chart)
+  SLM_MLFLOW_URI: http://mlflow.mlops.svc.cluster.local:5000
+
+# 1 replica everywhere; PDB must not block node drains with a single replica.
+serviceDefaults:
+  replicas: 1
+  pdb: { maxUnavailable: 1 }
+
+services:
+  gateway:
+    replicas: 1
+    pdb: { minAvailable: null, maxUnavailable: 1 }
+    autoscaling: { enabled: false }
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { memory: 1Gi }
+
+ingress:
+  className: nginx                    # k3s ships Traefik: disable it and install ingress-nginx, or set className: traefik
+  clusterIssuer: ""                   # bring your own TLS secrets (slm-api-tls / slm-app-tls) or a self-signed issuer
+  api: { host: api.spark.local }
+  app: { host: app.spark.local }
+
+vllm:
+  # NVIDIA's NGC container is the supported way to run vLLM on GB10 (aarch64 + CUDA 13). Verify the tag you pull.
+  image: { repository: nvcr.io/nvidia/vllm, tag: 25.09-py3 }
+  nodeSelector:
+    kubernetes.io/arch: arm64
+  cache:
+    storageClassName: local-path
+  modelDefaults:
+    resources:
+      requests: { cpu: "4", memory: 16Gi }
+      limits: { memory: 64Gi }
+    cache: { size: 200Gi }
+    args:
+      gpuMemoryUtilization: 0.35      # leaves room for a second model + OS on unified memory
+      maxModelLen: 8192
+      maxNumSeqs: 64
+  models:
+    phi-4-mini:
+      model: microsoft/Phi-4-mini-instruct
+      servedModelName: phi-4-mini
+    llama-3.1-8b:
+      enabled: false                  # enable together with GPU time-slicing
+      model: meta-llama/Llama-3.1-8B-Instruct
+      servedModelName: llama-3.1-8b
+
+trainer:
+  nodeSelector:
+    kubernetes.io/arch: arm64
+  # NOTE: build the trainer image for arm64 (see deploy/docker/Dockerfile.trainer header).
+
+monitoring:
+  serviceMonitor: { enabled: false }  # enable when kube-prometheus-stack (CRDs) is installed
+  prometheusRule: { enabled: false }
+
+otel:
+  replicas: 1
+
+# Dev/PoC convenience: in-cluster Postgres + Redis (set the passwords with --set; there are no defaults).
+postgresql:
+  bundled:
+    enabled: false
+    storageClassName: local-path
+redis:
+  bundled:
+    enabled: false
+    storageClassName: local-path

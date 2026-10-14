@@ -1,0 +1,261 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.11"
+  HELM_VERSION: v3.16.3
+  KUBERNETES_VERSION: "1.30.0"
+  CRD_SCHEMAS: "https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+
+jobs:
+  # ---------------------------------------------------------------- Python services
+  python:
+    name: Python (ruff + pytest, py${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: postgres:16.6
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: slm
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d slm"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7.4.1
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      # Integration tests that honour these use the service containers; the others fall back to embedded pgserver.
+      SLM_DATABASE_URL: postgresql://slm_app:slm_app_ci@localhost:5432/slm
+      SLM_REDIS_URL: redis://localhost:6379/0
+      SLM_TEST_DATABASE_URL: postgresql://slm_app:slm_app_ci@localhost:5432/slm
+      SLM_TEST_REDIS_URL: redis://localhost:6379/0
+      SLM_ENV: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Lockfile is up to date
+        run: uv lock --check
+      - name: Install workspace (frozen)
+        run: uv sync --frozen --all-packages
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format --check
+        if: matrix.python == '3.12'
+        run: uv run ruff format --check .
+      - name: Apply migrations (as the admin role; creates slm_app)
+        run: uv run python db/migrate.py --dsn postgresql://postgres:postgres@localhost:5432/slm --app-password slm_app_ci
+      - name: pytest
+        run: uv run pytest -ra
+
+  # ---------------------------------------------------------------- Web
+  web:
+    name: Web (lint, typecheck, test, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # ---------------------------------------------------------------- Helm / manifests / compose
+  helm:
+    name: Helm lint, template, kubeconform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CHART: deploy/helm/slm-studio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Install kubeconform (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kubeconform.tgz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          echo "95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73  /tmp/kubeconform.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/kubeconform.tgz -C /usr/local/bin kubeconform
+      - name: Grafana dashboard copies in the chart match deploy/grafana
+        run: diff -r deploy/grafana/dashboards "$CHART/dashboards"
+      - name: helm lint (default + every overlay)
+        run: |
+          set -euo pipefail
+          helm lint --strict "$CHART"
+          for f in "$CHART"/values-dgx-spark.yaml "$CHART"/values-ha.yaml "$CHART"/ci/values-full.yaml "$CHART"/ci/values-dev.yaml; do
+            echo "== lint with $f"; helm lint --strict "$CHART" -f "$f"
+          done
+          helm lint --strict "$CHART" -f "$CHART/values-ha.yaml" -f "$CHART/ci/values-full.yaml"
+      - name: helm template (all variants)
+        run: |
+          set -euo pipefail
+          mkdir -p rendered
+          helm template ci "$CHART" -n slm-studio                                                         > rendered/default.yaml
+          helm template ci "$CHART" -n slm-studio -f "$CHART/ci/values-full.yaml"                          > rendered/full.yaml
+          helm template ci "$CHART" -n slm-studio -f "$CHART/ci/values-dev.yaml"                           > rendered/dev.yaml
+          helm template ci "$CHART" -n slm-studio -f "$CHART/values-dgx-spark.yaml"                        > rendered/dgx-spark.yaml
+          helm template ci "$CHART" -n slm-studio -f "$CHART/values-ha.yaml" -f "$CHART/ci/values-full.yaml" > rendered/ha.yaml
+          helm template ci "$CHART" -n slm-studio -f "$CHART/values-ha.yaml" -f deploy/helm/environments/production.yaml > rendered/production.yaml
+          helm template ci "$CHART" -n slm-studio -f deploy/helm/environments/staging.yaml                 > rendered/staging.yaml
+      - name: kubeconform (strict, CRD schemas from the datree catalog)
+        run: |
+          set -euo pipefail
+          for f in rendered/*.yaml deploy/k8s/*.yaml; do
+            echo "== $f"
+            kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
+              -schema-location default -schema-location "$CRD_SCHEMAS" "$f"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rendered-manifests
+          path: rendered/
+          retention-days: 7
+
+  compose:
+    name: docker compose config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+      - run: docker compose --profile stub --profile vllm --profile gpu --profile trainer config --quiet
+
+  hadolint:
+    name: hadolint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install hadolint (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/hadolint https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          echo "56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010  /tmp/hadolint" | sha256sum -c -
+          sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint
+      - name: Lint Dockerfiles
+        run: |
+          set -euo pipefail
+          for f in deploy/docker/Dockerfile.*; do
+            echo "== $f"; hadolint --config deploy/docker/.hadolint.yaml "$f"
+          done
+      - name: Shell scripts
+        run: |
+          set -euo pipefail
+          for f in deploy/scripts/*.sh deploy/helm/slm-studio/files/*.sh; do bash -n "$f"; done
+          shellcheck deploy/scripts/*.sh deploy/helm/slm-studio/files/*.sh
+
+  docker-build:
+    name: Docker build smoke (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: gateway, file: Dockerfile.service, args: "SERVICE=gateway\nPORT=8000" }
+          - { image: web, file: Dockerfile.web, args: "NEXT_PUBLIC_USE_MOCKS=false" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/${{ matrix.file }}
+          build-args: ${{ matrix.args }}
+          push: false
+          cache-from: type=gha,scope=ci-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.image }}
+
+  # ---------------------------------------------------------------- security
+  trivy-fs:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vulnerabilities + secrets in the repo (uv.lock, package-lock.json, ...) - blocking on HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-dirs: web/node_modules,.venv
+      - name: IaC / Dockerfile misconfiguration (informational, not blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: deploy
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+  gitleaks:
+    name: gitleaks (secret scan, full history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  /tmp/gitleaks.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
+      - run: gitleaks detect --source . --redact --verbose --exit-code 1
+
+  # Single required status check for branch protection.
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [python, web, helm, compose, hadolint, docker-build, trivy-fs, gitleaks]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: All required jobs succeeded
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success")'

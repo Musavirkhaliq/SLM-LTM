@@ -1,0 +1,137 @@
+{{- /*
+  ServiceAccount + Deployment + Service for every entry of .Values.services (DRY: one range).
+  Per-service overrides are merged over .Values.serviceDefaults by the `slm.svc` helper.
+*/ -}}
+{{- range $name, $cfg := .Values.services }}
+{{- if $cfg.enabled }}
+{{- $svc := include "slm.svc" (dict "root" $ "name" $name "cfg" $cfg) | fromJson }}
+{{- $fullname := printf "%s-%s" (include "slm.fullname" $) $name }}
+{{- $tier := default "control-plane" $svc.tier }}
+{{- $sel := dict "app.kubernetes.io/name" (include "slm.name" $) "app.kubernetes.io/instance" $.Release.Name "app.kubernetes.io/component" $name }}
+{{- $autoscaled := dig "autoscaling" "enabled" false $svc }}
+{{- $hasInbound := ne $name "rag-worker" }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $name "tier" $tier) | nindent 4 }}
+  {{- with (dig "serviceAccount" "annotations" (dict) $svc) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: {{ dig "serviceAccount" "automount" false $svc }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $name "tier" $tier) | nindent 4 }}
+spec:
+  {{- if not $autoscaled }}
+  replicas: {{ $svc.replicas | int }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    {{- toYaml $svc.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- toYaml $sel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slm.componentLabels" (dict "root" $ "component" $name "tier" $tier) | nindent 8 }}
+        {{- if dig "egressExternal" true $svc }}
+        slm-studio.io/egress: external
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+    spec:
+      serviceAccountName: {{ $fullname }}
+      automountServiceAccountToken: {{ dig "serviceAccount" "automount" false $svc }}
+      {{- include "slm.pullSecrets" $ | nindent 6 }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $svc.terminationGracePeriodSeconds | int }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "slm.image" (dict "root" $ "image" $svc.image "name" $name) | quote }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+          {{- with $svc.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $svc.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port | int }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "slm.fullname" $ }}-config
+          env:
+            {{- include "slm.env" (dict "root" $ "name" $name "svc" $svc) | nindent 12 }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          startupProbe:
+            {{- include "slm.probe" $svc.probes.startup | nindent 12 }}
+          livenessProbe:
+            {{- include "slm.probe" $svc.probes.liveness | nindent 12 }}
+          readinessProbe:
+            {{- include "slm.probe" $svc.probes.readiness | nindent 12 }}
+          {{- if gt ($svc.preStopSleepSeconds | int) 0 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ $svc.preStopSleepSeconds | int | quote }}]
+          {{- end }}
+          volumeMounts:
+            {{- range $i, $p := $svc.writablePaths }}
+            - name: writable-{{ $i }}
+              mountPath: {{ $p }}
+            {{- end }}
+      volumes:
+        {{- range $i, $p := $svc.writablePaths }}
+        - name: writable-{{ $i }}
+          emptyDir:
+            sizeLimit: 1Gi
+        {{- end }}
+      {{- with $svc.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $svc.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "slm.scheduling" (dict "root" $ "selector" $sel) | nindent 6 }}
+{{- if $hasInbound }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $name "tier" $tier) | nindent 4 }}
+    {{- if ne (toString (dig "metrics" "enabled" true $svc)) "false" }}
+    slm-studio.io/scrape: services
+    {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ $svc.port | int }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- toYaml $sel | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

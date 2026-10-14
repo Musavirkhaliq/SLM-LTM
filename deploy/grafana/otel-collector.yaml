@@ -1,0 +1,50 @@
+# OpenTelemetry Collector (contrib) for docker compose. Services export OTLP/HTTP to :4318
+# (SLM_OTLP_ENDPOINT=http://otel-collector:4318). Metrics are re-exported on :8889 for Prometheus.
+# Traces/logs go to the debug exporter by default; add an otlp exporter (Tempo/Jaeger/Loki) below.
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  resource:
+    attributes:
+      - { key: deployment.environment, value: dev, action: upsert }
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion: { enabled: true }
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug]
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888

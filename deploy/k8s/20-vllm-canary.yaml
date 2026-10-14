@@ -1,0 +1,124 @@
+# Canary / blue-green sample: a SECOND vLLM server (new model version or new vLLM args) next to the stable one in
+# 10-vllm-deployment.yaml. Kubernetes itself does NOT split traffic here: the split happens in the SLM Studio
+# gateway, which resolves the client's `model` alias to weighted rows of `endpoint_routes` (see README.md in this folder).
+#
+#   stable : Service vllm-phi-4-mini         (label route=stable)
+#   canary : Service vllm-phi-4-mini-canary  (label route=canary)   <- this file
+#
+# Each one is registered as a `deployments` row (internal_url = its Service URL); the endpoint alias then points to both.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-phi-4-mini-canary
+  namespace: slm-studio
+  labels:
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/instance: phi-4-mini-canary
+    app.kubernetes.io/part-of: slm-studio
+    slm-studio.io/tier: inference
+    slm-studio.io/scrape: vllm
+    slm-studio.io/deployment: phi-4-mini-canary
+spec:
+  selector:
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/instance: phi-4-mini-canary
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-phi-4-mini-canary
+  namespace: slm-studio
+  labels:
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/instance: phi-4-mini-canary
+    app.kubernetes.io/part-of: slm-studio
+    slm-studio.io/tier: inference
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+      app.kubernetes.io/instance: phi-4-mini-canary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm
+        app.kubernetes.io/instance: phi-4-mini-canary
+        app.kubernetes.io/part-of: slm-studio
+        slm-studio.io/tier: inference
+        slm-studio.io/deployment: phi-4-mini-canary
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.10.2
+          command: ["vllm", "serve"]
+          args:
+            # The candidate: a fine-tuned version merged and published to object storage, or simply new flags.
+            - microsoft/Phi-4-mini-instruct
+            - --served-model-name=phi-4-mini
+            - --host=0.0.0.0
+            - --port=8000
+            - --max-model-len=16384
+            - --gpu-memory-utilization=0.90
+            - --enable-prefix-caching
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - { name: HOME, value: /tmp }
+            - { name: HF_HOME, value: /cache/hf }
+            - { name: VLLM_CACHE_ROOT, value: /cache/vllm }
+            - { name: TRITON_CACHE_DIR, value: /cache/triton }
+          resources:
+            requests: { cpu: "4", memory: 24Gi, nvidia.com/gpu: 1 }
+            limits: { memory: 48Gi, nvidia.com/gpu: 1 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 180
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 100Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

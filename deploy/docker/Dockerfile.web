@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1.9
+#
+# Next.js 15 (App Router) in `output: "standalone"` mode.
+#   docker build -f deploy/docker/Dockerfile.web -t slm-studio/web:dev .
+#
+# Requirements on web/: package-lock.json committed (npm ci) and next.config.* with
+# `output: "standalone"` (the build asserts this). NEXT_PUBLIC_* values are inlined at
+# build time: NEXT_PUBLIC_API_BASE (browser-visible gateway origin) and NEXT_PUBLIC_USE_MOCKS (must be "false" for a
+# real deployment; the UI falls back to its mock data layer when the API base is empty). One image per API origin.
+ARG NODE_VERSION=22.12.0
+ARG ALPINE_VERSION=3.21
+
+FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS deps
+WORKDIR /app
+RUN apk add --no-cache libc6-compat
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+
+FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS build
+WORKDIR /app
+ARG NEXT_PUBLIC_API_BASE=""
+ARG NEXT_PUBLIC_USE_MOCKS="false"
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    NODE_ENV=production \
+    NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE} \
+    NEXT_PUBLIC_USE_MOCKS=${NEXT_PUBLIC_USE_MOCKS}
+COPY --from=deps /app/node_modules ./node_modules
+COPY web/ ./
+RUN mkdir -p public
+RUN npm run build
+RUN test -f .next/standalone/server.js \
+ || { echo "ERROR: web/next.config.* must set output: 'standalone'" >&2; exit 1; }
+
+FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION} AS runtime
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG SOURCE=https://github.com/your-org/slm-studio
+LABEL org.opencontainers.image.title="slm-studio-web" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="${SOURCE}"
+
+RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app -H -h /nonexistent -s /sbin/nologin app
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    HOSTNAME=0.0.0.0 \
+    PORT=3000
+
+COPY --from=build --chown=10001:10001 /app/.next/standalone ./
+COPY --from=build --chown=10001:10001 /app/.next/static ./.next/static
+COPY --from=build --chown=10001:10001 /app/public ./public
+# Next writes its ISR / image-optimisation cache here; the Helm chart mounts an emptyDir on it
+# because the root filesystem is read-only.
+RUN mkdir -p /app/.next/cache && chown 10001:10001 /app/.next/cache
+
+USER 10001:10001
+EXPOSE 3000
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+CMD ["node", "server.js"]

@@ -1,0 +1,13 @@
+# DEV ONLY (docker compose): MLflow tracking server with Postgres backend store and S3/MinIO artifacts.
+# Production uses a managed/self-hosted MLflow outside this chart (set config.SLM_MLFLOW_URI).
+FROM python:3.12.8-slim-bookworm
+ARG MLFLOW_VERSION=2.17.2
+RUN pip install --no-cache-dir "mlflow==${MLFLOW_VERSION}" psycopg2-binary==2.9.10 boto3==1.35.90 \
+ && groupadd --system --gid 10001 mlflow \
+ && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin mlflow
+USER 10001:10001
+ENV HOME=/tmp
+EXPOSE 5000
+HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=5 \
+  CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=2).status==200 else 1)"]
+ENTRYPOINT ["mlflow", "server", "--host", "0.0.0.0", "--port", "5000"]

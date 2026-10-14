@@ -1,0 +1,87 @@
+name: Deploy
+
+# Flow: Build and Push succeeds on main  ->  staging deploys automatically  ->  production waits for the approval
+# configured on the `production` GitHub Environment (Settings > Environments > production > Required reviewers).
+# Manual run: pick an image tag (e.g. a previous sha-<40 hex> or 1.4.2) and an environment: this is also the way to
+# roll forward/back to a specific version.
+#
+# Each environment deploy: cosign signature verification -> helm upgrade --install --atomic (migration hook runs first)
+# -> smoke test (/readyz, /v1/models) -> automatic rollback to the previous revision if the smoke test fails.
+
+on:
+  workflow_run:
+    workflows: ["Build and Push"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (sha-<40 hex> | semver)"
+        required: true
+        type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  prepare:
+    name: Resolve version
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      ref: ${{ steps.v.outputs.ref }}
+    steps:
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "workflow_run" ]]; then
+            tag="sha-${RUN_SHA}"; ref="$RUN_SHA"
+          else
+            tag="$INPUT_TAG"; ref="$GITHUB_SHA"
+          fi
+          [[ "$tag" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { echo "invalid tag: $tag" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Deploying tag $tag (chart from $ref)" >> "$GITHUB_STEP_SUMMARY"
+
+  staging:
+    name: Staging
+    needs: prepare
+    if: github.event_name == 'workflow_run' || inputs.environment == 'staging'
+    uses: ./.github/workflows/_deploy-env.yml
+    with:
+      environment: staging
+      image_tag: ${{ needs.prepare.outputs.tag }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      web_image_name: web-staging
+      values_files: deploy/helm/environments/staging.yaml
+    secrets: inherit
+
+  production:
+    name: Production
+    needs: [prepare, staging]
+    # Auto flow: only after a successful staging deploy. Manual flow: only when production was chosen.
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' &&
+          ( (github.event_name == 'workflow_run' && needs.staging.result == 'success') ||
+            (github.event_name == 'workflow_dispatch' && inputs.environment == 'production') ) }}
+    uses: ./.github/workflows/_deploy-env.yml
+    with:
+      environment: production
+      image_tag: ${{ needs.prepare.outputs.tag }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      web_image_name: web
+      values_files: deploy/helm/environments/production.yaml
+    secrets: inherit

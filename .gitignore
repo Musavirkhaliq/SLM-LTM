@@ -1,0 +1,36 @@
+# Secrets: only .env.example is tracked, never the real .env
+.env
+.env.*
+!.env.example
+!web/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.uv-cache/
+
+# uv / build
+dist/
+build/
+
+# Node / web
+web/node_modules/
+web/.next/
+web/out/
+web/coverage/
+web/*.tsbuildinfo
+web/.claude/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,459 @@
+# SLM Studio - production-oriented defaults.
+# Overlays: values-dgx-spark.yaml (single-node DGX Spark), values-ha.yaml (multi-zone HA).
+#
+# Postgres, Redis, S3 (MinIO/AWS), MLflow and Qdrant are EXTERNAL by default: point `config`/`secrets` at them.
+# `postgresql.bundled` / `redis.bundled` exist for dev/demo clusters only.
+
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  imageRegistry: ghcr.io
+  imageRepositoryPrefix: your-org/slm-studio     # images resolve to <registry>/<prefix>/<name>:<tag>
+  imageTag: ""                                    # default: Chart.appVersion (deploy.yml sets the git SHA)
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []
+  commonLabels: {}
+
+# ---------------------------------------------------------------- security
+# Applied to every workload this chart creates (Pod Security "restricted" compatible).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# ---------------------------------------------------------------- scheduling (HA)
+scheduling:
+  podAntiAffinity: soft            # none | soft (preferred, per node) | hard (required, per node)
+  topologySpread:                  # applied to every Deployment/StatefulSet; labelSelector is filled in per workload
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+
+# ---------------------------------------------------------------- non-secret config (ConfigMap -> envFrom)
+# Computed by the chart and therefore NOT set here: SLM_OTLP_ENDPOINT (when otel.enabled), SLM_<SERVICE>_URL,
+# SLM_PUBLIC_BASE_URL (https://<ingress.api.host>), SLM_TRAINER_*, SLM_VLLM_*.
+config:
+  SLM_ENV: prod                                              # "prod" enables the insecure-default guards in slm_common
+  SLM_LOG_LEVEL: INFO
+  SLM_JWT_ALGORITHM: RS256
+  SLM_S3_ENDPOINT: ""                                        # empty = AWS S3; MinIO: http://minio.storage.svc:9000
+  SLM_S3_REGION: us-east-1
+  SLM_MLFLOW_URI: http://mlflow.mlops.svc.cluster.local:5000
+  SLM_QDRANT_URL: http://qdrant.vectordb.svc.cluster.local:6333
+  SLM_OTLP_ENDPOINT: ""                                      # used only when otel.enabled=false (external collector)
+
+# ---------------------------------------------------------------- secrets
+# Pods read secrets as env vars from ONE Secret. Key names are the env var names:
+#   SLM_DATABASE_URL (role slm_app, NOT the owner), SLM_REDIS_URL, SLM_JWT_PRIVATE_KEY, SLM_JWT_PUBLIC_KEY,
+#   SLM_S3_ACCESS_KEY, SLM_S3_SECRET_KEY, SLM_TRAINER_TOKEN
+#   optional: SLM_HF_TOKEN, SLM_WANDB_API_KEY, SLM_OAUTH__{AZURE_AD,GOOGLE,GITHUB}__CLIENT_SECRET
+# Source, in order of precedence:
+#   1. existingSecret            - a Secret you manage (sealed-secrets, SOPS, ...)
+#   2. externalSecret.enabled    - External Secrets Operator syncs it from your vault (default)
+#   3. create + values           - DEV ONLY: renders a Secret from values (never commit real values)
+secrets:
+  existingSecret: ""
+  externalSecret:
+    enabled: true
+    apiVersion: external-secrets.io/v1beta1
+    refreshInterval: 1h
+    secretStoreRef:
+      name: slm-studio
+      kind: ClusterSecretStore
+    data:
+      SLM_DATABASE_URL:    { key: slm-studio/production/postgres, property: app_url }
+      SLM_REDIS_URL:       { key: slm-studio/production/redis, property: url }
+      SLM_JWT_PRIVATE_KEY: { key: slm-studio/production/jwt, property: private_key }
+      SLM_JWT_PUBLIC_KEY:  { key: slm-studio/production/jwt, property: public_key }
+      SLM_S3_ACCESS_KEY:   { key: slm-studio/production/s3, property: access_key }
+      SLM_S3_SECRET_KEY:   { key: slm-studio/production/s3, property: secret_key }
+      SLM_TRAINER_TOKEN:   { key: slm-studio/production/trainer, property: token }
+      # Add only keys that exist in the store (ESO fails the whole sync on a missing remote key):
+      # SLM_HF_TOKEN:                      { key: slm-studio/production/huggingface, property: token }
+      # SLM_OAUTH__AZURE_AD__CLIENT_SECRET: { key: slm-studio/production/oauth, property: azure_ad }
+  create: false
+  values: {}
+
+# ---------------------------------------------------------------- database migrations (Helm hook)
+# Runs db/migrate.py (shipped in every service image) as the owner/admin role BEFORE install/upgrade. migrate.py also
+# creates/refreshes the runtime role slm_app (password from SLM_APP_PASSWORD, grants re-applied on each run).
+# Migrations must be backward compatible with the previous release (expand/contract) because old pods
+# keep serving while the Job runs.
+migration:
+  enabled: true
+  service: auth                      # which service image carries db/migrate.py
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 256Mi }
+  # Secret keys: SLM_MIGRATE_DATABASE_URL (owner/admin DSN, required) and SLM_APP_PASSWORD (optional: set it when
+  # migrate.py should create slm_app or rotate its password; omit if a DBA pre-creates the role).
+  existingSecret: ""
+  externalSecret:
+    data:
+      SLM_MIGRATE_DATABASE_URL: { key: slm-studio/production/postgres, property: migrator_url }
+      SLM_APP_PASSWORD:         { key: slm-studio/production/postgres, property: app_password }
+  createValues: {}                   # DEV ONLY: {SLM_MIGRATE_DATABASE_URL: "postgresql://...", SLM_APP_PASSWORD: "..."}
+
+# ---------------------------------------------------------------- control-plane services
+# Defaults merged (top-level keys, shallow) under every entry of `services`.
+serviceDefaults:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 25%, maxUnavailable: 0 }
+  terminationGracePeriodSeconds: 60
+  preStopSleepSeconds: 10            # let the endpoint controller/ingress drop the pod before SIGTERM
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  probes:
+    startup:   { path: /healthz, periodSeconds: 2, failureThreshold: 30 }
+    liveness:  { path: /healthz, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+    readiness: { path: /readyz,  periodSeconds: 5,  timeoutSeconds: 3, failureThreshold: 3 }
+  pdb: { maxUnavailable: 1 }
+  writablePaths: [/tmp]              # emptyDir mounts (root filesystem is read-only)
+  # optional per service: tier, command, args, env, secretEnv, optionalSecretEnv, nodeSelector, tolerations,
+  # serviceAccount {annotations, automount}, autoscaling, metrics {enabled}, egressExternal, image {name, tag, digest}
+
+services:
+  gateway:
+    enabled: true
+    tier: edge
+    port: 8000
+    replicas: 3
+    terminationGracePeriodSeconds: 120          # drain in-flight SSE streams
+    resources:
+      requests: { cpu: 500m, memory: 512Mi }
+      limits: { memory: 1Gi }
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY]
+    env:
+      SLM_TRUST_FORWARDED_FOR: "true"           # client IP from ingress-nginx's X-Forwarded-For (NetworkPolicy blocks direct access)
+    pdb: { minAvailable: 2 }
+    autoscaling:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 20
+      targetCPUUtilizationPercentage: 65
+      # Custom per-pod metric. Needs prometheus-adapter exposing `slm_http_requests_per_second` from the recording
+      # rule slm:http_requests_per_second:rate2m, e.g.:
+      #   - seriesQuery: 'slm:http_requests_per_second:rate2m{namespace!="",pod!=""}'
+      #     resources: { overrides: { namespace: {resource: namespace}, pod: {resource: pod} } }
+      #     name: { as: slm_http_requests_per_second }
+      #     metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+      requestsPerSecond:
+        enabled: false                          # enable once prometheus-adapter is configured (HPA stays CPU-only otherwise)
+        metricName: slm_http_requests_per_second
+        targetAverageValue: "150"
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - { type: Percent, value: 100, periodSeconds: 30 }
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - { type: Pods, value: 1, periodSeconds: 60 }
+
+  auth:
+    enabled: true
+    port: 8001
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PRIVATE_KEY, SLM_JWT_PUBLIC_KEY]
+    optionalSecretEnv:                      # AuthSettings: SLM_OAUTH__<PROVIDER>__CLIENT_SECRET (client ids/tenants go in `env`)
+      - SLM_OAUTH__AZURE_AD__CLIENT_SECRET
+      - SLM_OAUTH__GOOGLE__CLIENT_SECRET
+      - SLM_OAUTH__GITHUB__CLIENT_SECRET
+
+  registry:
+    enabled: true
+    port: 8002
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY, SLM_S3_ACCESS_KEY, SLM_S3_SECRET_KEY]
+    optionalSecretEnv: [SLM_HF_TOKEN]
+
+  finetune:
+    enabled: true
+    port: 8003
+    # Creates trainer Jobs through the Kubernetes API (RBAC in templates/trainer-rbac.yaml).
+    serviceAccount: { automount: true }
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY, SLM_S3_ACCESS_KEY, SLM_S3_SECRET_KEY, SLM_TRAINER_TOKEN]
+    optionalSecretEnv: [SLM_HF_TOKEN, SLM_WANDB_API_KEY]
+
+  rag:
+    enabled: true
+    port: 8004
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { memory: 1Gi }
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY, SLM_S3_ACCESS_KEY, SLM_S3_SECRET_KEY]
+
+  # Ingestion worker: the `rag` image with another command (see deploy/docker/README.md). No inbound traffic.
+  # The probes below are HTTP: the worker must serve /healthz on `port`, otherwise replace them (the chart only renders
+  # httpGet probes) or run it behind a tiny health sidecar.
+  rag-worker:
+    enabled: false
+    image: { name: rag }
+    port: 8004
+    replicas: 1
+    command: ["python", "-m", "slm_rag.worker"]   # ASSUMED entrypoint: adjust to the module the rag service ships
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { memory: 2Gi }
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_S3_ACCESS_KEY, SLM_S3_SECRET_KEY]
+    probes:
+      startup:   { path: /healthz, periodSeconds: 2, failureThreshold: 30 }
+      liveness:  { path: /healthz, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+      readiness: { path: /healthz, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
+
+  evaluation:
+    enabled: true
+    port: 8005
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY, SLM_S3_ACCESS_KEY, SLM_S3_SECRET_KEY]
+
+  deployment:
+    enabled: true
+    port: 8006
+    # Creates/scales vLLM StatefulSets+Services at runtime (RBAC: deploymentController.rbac).
+    serviceAccount: { automount: true }
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY, SLM_S3_ACCESS_KEY, SLM_S3_SECRET_KEY]
+    optionalSecretEnv: [SLM_HF_TOKEN]
+
+  monitoring:
+    enabled: true
+    port: 8007
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY]
+
+  cost:
+    enabled: true
+    port: 8008
+    secretEnv: [SLM_DATABASE_URL, SLM_REDIS_URL, SLM_JWT_PUBLIC_KEY]
+
+  web:
+    enabled: true
+    tier: frontend
+    image: { name: web }
+    port: 3000
+    metrics: { enabled: false }
+    egressExternal: false
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { memory: 512Mi }
+    writablePaths: [/tmp, /app/.next/cache]
+    probes:
+      startup:   { path: /, periodSeconds: 2, failureThreshold: 60 }
+      liveness:  { path: /, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+      readiness: { path: /, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
+
+# ---------------------------------------------------------------- ingress (ingress-nginx + cert-manager)
+ingress:
+  enabled: true
+  className: nginx
+  clusterIssuer: letsencrypt-prod            # cert-manager.io/cluster-issuer; "" to manage TLS Secrets yourself
+  controllerNamespace: ingress-nginx         # used by NetworkPolicy
+  api:
+    host: api.slm.example.com                # -> gateway (OpenAI-compatible /v1/* and /api/v1/*)
+    tlsSecretName: slm-api-tls
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: "512m"        # dataset / document uploads
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"     # long generations, SSE, websocket stream
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"         # stream tokens as they are produced
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+  app:
+    host: app.slm.example.com                # -> web
+    tlsSecretName: slm-app-tls
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+
+# ---------------------------------------------------------------- network policy
+networkPolicy:
+  enabled: true
+  monitoringNamespace: monitoring            # where Prometheus runs (scrapes /metrics)
+  allowIntraControlPlane: true               # control-plane services may call each other (e.g. finetune -> registry)
+  # Egress to things outside the release (databases, object storage, MLflow, Qdrant, Hugging Face, IdPs).
+  # Without `to` the rule allows the ports to ANY destination: tighten with ipBlock/namespaceSelector for production.
+  externalEgress:
+    - name: postgres
+      ports: [5432]
+      to: []
+    - name: redis
+      ports: [6379]
+      to: []
+    - name: https-and-object-storage
+      ports: [443, 9000]
+      to: []
+    - name: mlflow-qdrant
+      ports: [5000, 6333, 6334]
+      to: []
+
+# ---------------------------------------------------------------- vLLM model servers
+# Platform-managed models (e.g. the shared catalogue). Tenant deployments created at runtime by the
+# `deployment` service reuse SLM_VLLM_* settings below and are discovered via labels:
+#   slm-studio.io/scrape: vllm   slm-studio.io/deployment: <name>   app.kubernetes.io/part-of: slm-studio
+vllm:
+  enabled: true
+  image: { repository: vllm/vllm-openai, tag: v0.10.2 }     # DGX Spark/arm64: see values-dgx-spark.yaml
+  command: ["vllm", "serve"]
+  runtimeClassName: ""                                       # "nvidia" if the GPU operator is not the default runtime
+  nodeSelector:
+    nvidia.com/gpu.present: "true"                           # set by GPU feature discovery
+  tolerations:
+    - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+  shmSize: 8Gi
+  cache:
+    storageClassName: ""                                     # "" = cluster default
+    existingClaim: ""                                        # RWX claim shared by all replicas; else a PVC per replica
+  s3Fetcher:
+    image: amazon/aws-cli:2.22.0                             # used only when `model` is an s3:// URI
+  keda:
+    prometheusAddress: http://prometheus-operated.monitoring.svc:9090
+  modelDefaults:
+    enabled: true
+    gpu: 1
+    replicas: 1
+    terminationGracePeriodSeconds: 120
+    resources:
+      requests: { cpu: "4", memory: 24Gi }
+      limits: { memory: 48Gi }
+    cache: { size: 100Gi }
+    pdb: { maxUnavailable: 1 }
+    autoscaling:
+      keda:
+        enabled: false
+        minReplicas: 1
+        maxReplicas: 4
+        queueDepthThreshold: "8"                             # waiting requests per replica
+        cooldownPeriod: 600
+    args:                                                    # mapped to vLLM CLI flags (see templates/vllm.yaml)
+      maxModelLen: 8192
+      gpuMemoryUtilization: 0.90
+      enablePrefixCaching: true                              # KV cache reuse across requests
+      maxNumSeqs: 128
+      maxNumBatchedTokens: 8192
+      tensorParallelSize: 1
+    extraArgs: []
+  models:
+    phi-4-mini:
+      model: microsoft/Phi-4-mini-instruct                   # HF repo, or s3://models/... (fetched by init container)
+      servedModelName: phi-4-mini
+      args:
+        maxModelLen: 16384
+        # speculativeConfig:                                 # speculative decoding (passed as --speculative-config JSON)
+        #   method: ngram
+        #   num_speculative_tokens: 5
+        #   prompt_lookup_max: 4
+        # quantization: fp8
+        # enableLora: true
+        # loraModules: ["support-bot=/cache/adapters/support-bot"]
+
+# ---------------------------------------------------------------- trainer (Kubernetes Jobs created by `finetune`)
+trainer:
+  image: { name: trainer }
+  namespace: ""                          # default: release namespace (Jobs, Role and RoleBinding live there)
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  tolerations:
+    - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 2
+  activeDeadlineSeconds: 172800          # hard stop after 48 h
+
+deploymentController:
+  rbac:
+    enabled: true                        # lets the deployment service manage vLLM StatefulSets/Services/PVCs here
+
+# ---------------------------------------------------------------- observability
+monitoring:
+  serviceMonitor:
+    enabled: true                        # requires Prometheus Operator CRDs
+    interval: 15s
+    labels: {}                           # e.g. { release: kube-prometheus-stack }
+  prometheusRule:
+    enabled: true
+    labels: {}
+    metrics:                             # HTTP server metrics exported by slm_common.telemetry (labels: service, method, route, status)
+      httpRequestsTotal: slm_http_requests_total
+      httpRequestDuration: slm_http_request_duration_seconds
+    thresholds:
+      errorRatio: 0.05
+      gatewayP95Seconds: 30
+      ttftP95Seconds: 2
+      queueWaiting: 20
+      kvCacheRatio: 0.95
+      gpuUtilizationPercent: 95
+      gpuMemoryPercent: 95
+  grafanaDashboards:
+    enabled: true
+    sidecarLabel: grafana_dashboard      # kube-prometheus-stack / grafana chart sidecar label
+    folder: SLM Studio
+
+otel:
+  enabled: true
+  replicas: 2
+  image: { repository: otel/opentelemetry-collector-contrib, tag: 0.116.1 }
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  # Collector configuration. Lists (pipelines) are replaced, maps merged: to ship traces add e.g.
+  #   exporters: { otlp/tempo: { endpoint: tempo.monitoring.svc:4317, tls: { insecure: true } } }
+  #   service.pipelines.traces.exporters: [otlp/tempo]
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc: { endpoint: 0.0.0.0:4317 }
+          http: { endpoint: 0.0.0.0:4318 }
+    processors:
+      memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 25 }
+      batch: { send_batch_size: 1024, timeout: 5s }
+    exporters:
+      prometheus: { endpoint: 0.0.0.0:8889, resource_to_telemetry_conversion: { enabled: true } }
+      debug: { verbosity: basic }
+    extensions:
+      health_check: { endpoint: 0.0.0.0:13133 }
+    service:
+      extensions: [health_check]
+      telemetry:
+        metrics: { address: 0.0.0.0:8888 }
+      pipelines:
+        traces:  { receivers: [otlp], processors: [memory_limiter, batch], exporters: [debug] }
+        metrics: { receivers: [otlp], processors: [memory_limiter, batch], exporters: [prometheus] }
+        logs:    { receivers: [otlp], processors: [memory_limiter, batch], exporters: [debug] }
+
+# ---------------------------------------------------------------- bundled dependencies (DEV / DEMO ONLY)
+postgresql:
+  bundled:
+    enabled: false
+    image: postgres:16.6-alpine
+    storageSize: 20Gi
+    storageClassName: ""
+    auth:                                # all required when enabled; no defaults on purpose
+      postgresPassword: ""
+      migratorPassword: ""
+      appPassword: ""
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { memory: 1Gi }
+
+redis:
+  bundled:
+    enabled: false
+    image: redis:7.4.1-alpine
+    storageSize: 5Gi
+    storageClassName: ""
+    password: ""                         # required when enabled
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { memory: 512Mi }

@@ -1,0 +1,82 @@
+{{- /*
+  Prometheus Operator scrape config. Relabelling produces the label contract used by dashboards and alerts:
+    slm_service    = control-plane service name        slm_deployment = vLLM deployment (model) name
+*/ -}}
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+{{- $sm := .Values.monitoring.serviceMonitor }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "slm.fullname" . }}-services
+  labels:
+    {{- include "slm.labels" . | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      slm-studio.io/scrape: services
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ $sm.interval }}
+      scrapeTimeout: 10s
+      honorLabels: true          # keep the app's own `service` label (slm_http_* metrics) instead of exported_service
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_component]
+          targetLabel: slm_service
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "slm.fullname" . }}-vllm
+  labels:
+    {{- include "slm.labels" . | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: slm-studio
+      slm-studio.io/scrape: vllm
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ $sm.interval }}
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_label_slm_studio_io_deployment]
+          targetLabel: slm_deployment
+{{- if .Values.otel.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "slm.fullname" . }}-otel-collector
+  labels:
+    {{- include "slm.labels" . | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: otel-collector
+  endpoints:
+    - port: prom-app          # application metrics re-exported from OTLP
+      interval: {{ $sm.interval }}
+    - port: prom-self         # collector self-metrics
+      interval: {{ $sm.interval }}
+{{- end }}
+{{- end }}

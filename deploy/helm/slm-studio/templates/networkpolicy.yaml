@@ -1,0 +1,404 @@
+{{- /*
+  Zero-trust network model for the release's pods (selected by app.kubernetes.io/instance):
+    1. default-deny ingress + egress
+    2. explicit allows: DNS, OTLP, ingress-controller -> gateway/web, gateway -> control-plane/inference,
+       web -> gateway, Prometheus scrape, trainer -> finetune, and egress to external data stores
+       (pods labelled slm-studio.io/egress=external).
+  Pod labels used: slm-studio.io/tier = edge | control-plane | frontend | inference | trainer | migration | infra
+  Trainer Jobs created by the finetune service MUST carry app.kubernetes.io/instance=<release>,
+  slm-studio.io/tier=trainer and slm-studio.io/egress=external to be admitted.
+*/ -}}
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullname := include "slm.fullname" . }}
+{{- $instance := dict "app.kubernetes.io/instance" .Release.Name }}
+{{- $np := .Values.networkPolicy }}
+{{- $labels := include "slm.labels" . }}
+{{- /* ports of all enabled control-plane + edge services */ -}}
+{{- $cpPorts := list }}
+{{- $scrapePorts := list }}
+{{- range $name, $cfg := .Values.services }}
+{{- if $cfg.enabled }}
+{{- if has (default "control-plane" $cfg.tier) (list "control-plane" "edge") }}
+{{- $cpPorts = append $cpPorts ($cfg.port | int) }}
+{{- end }}
+{{- if ne (toString (dig "metrics" "enabled" true $cfg)) "false" }}
+{{- $scrapePorts = append $scrapePorts ($cfg.port | int) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $scrapePorts = concat $scrapePorts (list 8000) }}
+{{- if .Values.otel.enabled }}
+{{- $scrapePorts = concat $scrapePorts (list 8888 8889) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-default-deny
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml $instance | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-dns
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml $instance | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+{{- if .Values.otel.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-otlp
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  # workloads -> collector (egress) and collector <- workloads (ingress)
+  podSelector:
+    matchLabels:
+      {{- toYaml $instance | nindent 6 }}
+  policyTypes: [Egress, Ingress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: otel-collector
+      ports:
+        - { protocol: TCP, port: 4317 }
+        - { protocol: TCP, port: 4318 }
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml $instance | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 4317 }
+        - { protocol: TCP, port: 4318 }
+{{- end }}
+{{- if $np.externalEgress }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-external-egress
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      slm-studio.io/egress: external
+  policyTypes: [Egress]
+  egress:
+    {{- range $np.externalEgress }}
+    - ports:
+        {{- range .ports }}
+        - { protocol: TCP, port: {{ . | int }} }
+        {{- end }}
+      {{- with .to }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-ingress-controller
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/instance, operator: In, values: [{{ .Release.Name }}] }
+      - { key: slm-studio.io/tier, operator: In, values: [edge, frontend] }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.ingress.controllerNamespace }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.services.gateway.port | int }} }
+        - { protocol: TCP, port: {{ .Values.services.web.port | int }} }
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-gateway-to-backends
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  # gateway egress: control-plane services + vLLM servers. Ingress counterpart is allowed below.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: gateway
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              slm-studio.io/tier: control-plane
+      ports:
+        {{- range (uniq $cpPorts) }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              slm-studio.io/tier: inference
+      ports:
+        - { protocol: TCP, port: 8000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-control-plane-ingress
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      slm-studio.io/tier: control-plane
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: gateway
+        {{- if $np.allowIntraControlPlane }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              slm-studio.io/tier: control-plane
+        {{- end }}
+      ports:
+        {{- range (uniq $cpPorts) }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+    # trainer Jobs report progress to the finetune service
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              slm-studio.io/tier: trainer
+      ports:
+        - { protocol: TCP, port: {{ .Values.services.finetune.port | int }} }
+{{- if $np.allowIntraControlPlane }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-control-plane-egress
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  # control-plane -> control-plane/edge services and -> vLLM (health, metrics, deployment lifecycle)
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      slm-studio.io/tier: control-plane
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              slm-studio.io/tier: control-plane
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              slm-studio.io/tier: edge
+      ports:
+        {{- range (uniq $cpPorts) }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              slm-studio.io/tier: inference
+      ports:
+        - { protocol: TCP, port: 8000 }
+{{- end }}
+{{- if .Values.services.deployment.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-kube-api-egress
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  # finetune/deployment talk to the Kubernetes API (create Jobs / StatefulSets). API server addresses are
+  # cluster specific: ports only; tighten with `to.ipBlock` of your control-plane endpoint if needed.
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/instance, operator: In, values: [{{ .Release.Name }}] }
+      - { key: app.kubernetes.io/component, operator: In, values: [finetune, deployment] }
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 6443 }
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-inference-ingress
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      slm-studio.io/tier: inference
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/instance, operator: In, values: [{{ .Release.Name }}] }
+              - { key: app.kubernetes.io/component, operator: In, values: [gateway, deployment, monitoring, evaluation] }
+      ports:
+        - { protocol: TCP, port: 8000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-web-to-gateway
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: web
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: gateway
+      ports:
+        - { protocol: TCP, port: {{ .Values.services.gateway.port | int }} }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-gateway-from-web
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: web
+      ports:
+        - { protocol: TCP, port: {{ .Values.services.gateway.port | int }} }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-trainer-egress
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  # trainer Jobs: report to finetune; object storage / MLflow / Hugging Face come from allow-external-egress.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      slm-studio.io/tier: trainer
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: finetune
+      ports:
+        - { protocol: TCP, port: {{ .Values.services.finetune.port | int }} }
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-prometheus-scrape
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml $instance | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.monitoringNamespace }}
+      ports:
+        {{- range (uniq $scrapePorts) }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+{{- end }}
+{{- if or .Values.postgresql.bundled.enabled .Values.redis.bundled.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-bundled-datastores-ingress
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      slm-studio.io/tier: infra
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/instance, operator: In, values: [{{ .Release.Name }}] }
+              - { key: slm-studio.io/tier, operator: In, values: [control-plane, edge, migration] }
+      ports:
+        - { protocol: TCP, port: 5432 }
+        - { protocol: TCP, port: 6379 }
+{{- end }}
+{{- end }}

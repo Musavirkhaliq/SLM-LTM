@@ -1,0 +1,90 @@
+# Overlay for a highly available multi-zone cluster (3+ zones, GPU node pool spread across zones).
+#
+#   helm upgrade --install slm-studio deploy/helm/slm-studio -n slm-studio \
+#     -f deploy/helm/slm-studio/values.yaml -f deploy/helm/slm-studio/values-ha.yaml ...
+#
+# Requirements: prometheus-adapter (RPS metric), KEDA (vLLM queue-depth scaling), External Secrets Operator,
+# and external HA Postgres/Redis (managed service or operator). Capacity planning: with hard zone spread every zone
+# must have schedulable capacity (CPU nodes for the control plane, GPU nodes for vLLM) or pods stay Pending.
+
+scheduling:
+  # `hard` hostname anti-affinity needs >= replicas nodes; with HPA up to 30 gateway pods use zone spread
+  # (DoNotSchedule) + preferred node anti-affinity instead. Switch to `hard` for small fixed replica counts.
+  podAntiAffinity: soft
+  topologySpread:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+
+serviceDefaults:
+  replicas: 3
+  pdb: { maxUnavailable: 1 }
+
+services:
+  gateway:
+    replicas: 4
+    pdb: { minAvailable: 3 }
+    resources:
+      requests: { cpu: "1", memory: 1Gi }
+      limits: { memory: 2Gi }
+    autoscaling:
+      enabled: true
+      minReplicas: 4
+      maxReplicas: 30
+      targetCPUUtilizationPercentage: 60
+      requestsPerSecond:
+        enabled: true
+        metricName: slm_http_requests_per_second
+        targetAverageValue: "100"
+  auth:
+    replicas: 3
+  registry:
+    replicas: 3
+  finetune:
+    replicas: 2
+  rag:
+    replicas: 3
+  evaluation:
+    replicas: 2
+  deployment:
+    replicas: 2
+  monitoring:
+    replicas: 3
+  cost:
+    replicas: 2
+  web:
+    replicas: 3
+
+vllm:
+  modelDefaults:
+    replicas: 2
+    pdb: { maxUnavailable: 1 }
+    autoscaling:
+      keda:
+        enabled: true
+        minReplicas: 2
+        maxReplicas: 8
+        queueDepthThreshold: "6"
+        cooldownPeriod: 900
+
+otel:
+  replicas: 3
+
+networkPolicy:
+  # Pin egress to your managed services instead of "any destination" (examples; adapt to your CIDRs):
+  externalEgress:
+    - name: postgres
+      ports: [5432]
+      to: [{ ipBlock: { cidr: 10.0.0.0/8 } }]
+    - name: redis
+      ports: [6379]
+      to: [{ ipBlock: { cidr: 10.0.0.0/8 } }]
+    - name: https-and-object-storage
+      ports: [443, 9000]
+      to: []
+    - name: mlflow-qdrant
+      ports: [5000, 6333, 6334]
+      to: [{ ipBlock: { cidr: 10.0.0.0/8 } }]

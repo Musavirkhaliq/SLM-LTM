@@ -1,0 +1,26 @@
+# Dev-cluster shape used by CI: bundled Postgres/Redis + plain Secrets rendered from values, no operators required.
+# Dummy credentials only.
+secrets:
+  externalSecret: { enabled: false }
+  create: true
+  values:
+    SLM_JWT_PRIVATE_KEY: ci-only
+    SLM_JWT_PUBLIC_KEY: ci-only
+    SLM_S3_ACCESS_KEY: ci-only
+    SLM_S3_SECRET_KEY: ci-only
+    SLM_TRAINER_TOKEN: ci-only
+postgresql:
+  bundled:
+    enabled: true
+    auth: { postgresPassword: ci-only, migratorPassword: ci-only, appPassword: ci-only }
+redis:
+  bundled:
+    enabled: true
+    password: ci-only
+monitoring:
+  serviceMonitor: { enabled: false }
+  prometheusRule: { enabled: false }
+ingress:
+  enabled: false
+vllm:
+  enabled: false

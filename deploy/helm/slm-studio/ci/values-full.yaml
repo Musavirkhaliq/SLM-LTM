@@ -1,0 +1,37 @@
+# Used by CI (`helm lint` / `helm template` / kubeconform) to exercise every optional template.
+# Dummy credentials only. Not a deployable configuration.
+secrets:
+  externalSecret:
+    enabled: true
+migration:
+  enabled: true
+services:
+  rag-worker:
+    enabled: true
+vllm:
+  modelDefaults:
+    autoscaling:
+      keda:
+        enabled: true
+  models:
+    phi-4-mini:
+      model: microsoft/Phi-4-mini-instruct
+      args:
+        speculativeConfig: { method: ngram, num_speculative_tokens: 5, prompt_lookup_max: 4 }
+        quantization: fp8
+        enableLora: true
+        maxLoras: 4
+        loraModules: ["support-bot=/cache/adapters/support-bot"]
+    from-registry:
+      model: s3://models/org-1/custom-model/1/
+      servedModelName: custom
+      args:
+        enablePrefixCaching: false
+postgresql:
+  bundled:
+    enabled: true
+    auth: { postgresPassword: ci-only, migratorPassword: ci-only, appPassword: ci-only }
+redis:
+  bundled:
+    enabled: true
+    password: ci-only

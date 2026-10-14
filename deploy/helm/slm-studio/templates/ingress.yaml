@@ -1,0 +1,53 @@
+{{- /*
+  Two Ingress objects on separate hosts (different timeouts/body limits):
+    api.<domain> -> gateway (OpenAI-compatible /v1/* and /api/v1/*)      app.<domain> -> web UI
+  TLS certificates come from cert-manager through the cluster-issuer annotation.
+*/ -}}
+{{- if .Values.ingress.enabled }}
+{{- $ing := .Values.ingress }}
+{{- range $key, $target := dict "api" "gateway" "app" "web" }}
+{{- $conf := get $ing $key }}
+{{- $port := (get $.Values.services $target).port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "slm.fullname" $ }}-{{ $key }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" (printf "ingress-%s" $key) "tier" "edge") | nindent 4 }}
+  annotations:
+    {{- with $ing.clusterIssuer }}
+    cert-manager.io/cluster-issuer: {{ . | quote }}
+    {{- end }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    {{- if eq $key "api" }}
+    # The web UI (app.<domain>) calls the gateway cross-origin; the gateway itself has no CORS middleware.
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: {{ printf "https://%s" $ing.app.host | quote }}
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, Content-Type, X-Request-ID"
+    nginx.ingress.kubernetes.io/cors-expose-headers: "X-Request-ID, X-SLM-Route, X-RateLimit-Limit, X-RateLimit-Remaining"
+    {{- end }}
+    {{- with $conf.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ $ing.className }}
+  tls:
+    - hosts:
+        - {{ $conf.host | quote }}
+      secretName: {{ $conf.tlsSecretName }}
+  rules:
+    - host: {{ $conf.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "slm.fullname" $ }}-{{ $target }}
+                port:
+                  number: {{ $port | int }}
+{{- end }}
+{{- end }}

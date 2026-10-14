@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: slm-studio
+    orgId: 1
+    folder: SLM Studio
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

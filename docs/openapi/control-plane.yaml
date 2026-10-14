@@ -1,0 +1,2965 @@
+openapi: 3.1.0
+info:
+  title: SLM Studio Control Plane API
+  version: 0.1.0
+  summary: REST API under /api/v1/* behind the SLM Studio gateway (CONTRACT.md section 5).
+  description: |
+    The gateway reverse-proxies `/api/v1/*` to the owning service by path prefix. Authentication is a JWT
+    bearer (15 minute access token) issued by the auth service; the active organization is the `org` claim.
+
+    **Conventions** (CONTRACT.md section 2)
+
+    - Errors are RFC 7807 `application/problem+json`.
+    - Lists are cursor-paginated: `?limit=50&cursor=<opaque>` returns `{"items": [...], "next_cursor": "..." | null}`.
+    - Every mutation writes `audit_logs`.
+    - Every response carries `X-Request-ID`.
+    - IDs are UUIDs.
+    - Minimum role per operation is given in `x-required-role` (`viewer` < `developer` < `ml_engineer` < `org_admin` < `platform_admin`).
+
+    **Status.** Auth and registry operations are implemented. Deployment, fine-tuning, RAG, evaluation, monitoring,
+    cost and audit operations are served by typed stubs: the shapes below are the target contract, and not
+    every operation has business logic behind it yet. Operations marked `x-proposed: true` are not in CONTRACT.md
+    section 5 but are required by the web UI; they should be added to the contract. Request/response bodies are
+    **Proposed** where CONTRACT.md only lists the path.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://localhost:8000
+    description: Local development (gateway)
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth
+  - name: Organization
+  - name: Projects
+  - name: API keys
+  - name: Registry
+  - name: Deployments
+  - name: Fine-tuning
+  - name: RAG
+  - name: Evaluation
+  - name: Monitoring
+  - name: Cost
+  - name: Audit
+paths:
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Register a user (and optionally create an organization)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Exchange credentials for tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshToken
+      summary: Rotate the refresh token and get a new access token
+      description: Reusing an already-rotated refresh token revokes the whole token family.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke the current refresh-token family
+      responses:
+        '204':
+          description: Logged out.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/auth/oauth/{provider}/start:
+    get:
+      tags: [Auth]
+      operationId: oauthStart
+      summary: Begin OAuth sign-in
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/OAuthProvider'
+      responses:
+        '302':
+          description: Redirect to the identity provider.
+          headers:
+            Location:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/auth/oauth/{provider}/callback:
+    get:
+      tags: [Auth]
+      operationId: oauthCallback
+      summary: OAuth redirect target
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/OAuthProvider'
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tokens (or a redirect to the web app carrying a one-time code, implementation choice).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '302':
+          description: Redirect to the web app.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/me:
+    get:
+      tags: [Auth]
+      operationId: getMe
+      summary: Current user and memberships
+      x-required-role: viewer
+      responses:
+        '200':
+          description: The user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/orgs/switch:
+    post:
+      tags: [Organization]
+      operationId: switchOrg
+      summary: Switch the active organization
+      description: Returns new tokens whose `org` and `role` claims reflect the target membership.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [org_id]
+              properties:
+                org_id:
+                  type: string
+                  format: uuid
+      responses:
+        '200':
+          description: New tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/orgs/members:
+    get:
+      tags: [Organization]
+      operationId: listMembers
+      summary: List organization members
+      x-required-role: org_admin
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Organization]
+      operationId: addMember
+      summary: Add or invite a member
+      x-required-role: org_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddMemberRequest'
+      responses:
+        '201':
+          description: Member added.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/orgs/members/{user_id}:
+    patch:
+      tags: [Organization]
+      operationId: updateMember
+      summary: Change a member's role
+      x-required-role: org_admin
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  $ref: '#/components/schemas/OrgRole'
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Organization]
+      operationId: removeMember
+      summary: Remove a member
+      description: Fails with 409 if it would remove the last `org_admin`.
+      x-required-role: org_admin
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '204':
+          description: Removed.
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: List projects
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Projects.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPage'
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: Create a project
+      x-required-role: developer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreate'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/projects/{id}:
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: Get a project
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Projects]
+      operationId: updateProject
+      summary: Update a project
+      x-required-role: developer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectUpdate'
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Projects]
+      operationId: deleteProject
+      summary: Soft-delete a project
+      x-required-role: org_admin
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '204':
+          description: Deleted.
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/api-keys:
+    get:
+      tags: [API keys]
+      operationId: listApiKeys
+      summary: List API keys (never returns secrets)
+      x-required-role: developer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Keys.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyPage'
+    post:
+      tags: [API keys]
+      operationId: createApiKey
+      summary: Create an API key
+      description: |
+        The plaintext key is returned once. `scope=organization` requires `org_admin`;
+        `scope=project` (with `project_id`) requires `developer`.
+      x-required-role: developer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiKeyCreate'
+      responses:
+        '201':
+          description: Created; contains the plaintext key once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyWithSecret'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/api-keys/{id}/rotate:
+    post:
+      tags: [API keys]
+      operationId: rotateApiKey
+      summary: Rotate an API key
+      description: Creates a new key linked by `rotated_from`; the old key stays valid until `grace_until`.
+      x-required-role: developer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grace_period_seconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 2592000
+                  default: 86400
+      responses:
+        '201':
+          description: New key (plaintext shown once).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyWithSecret'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/api-keys/{id}:
+    delete:
+      tags: [API keys]
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: Sets `revoked_at`; effective at the gateway within the 60 s cache TTL (push invalidation is a design goal).
+      x-required-role: developer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '204':
+          description: Revoked.
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/api-keys/{id}/usage:
+    get:
+      tags: [API keys]
+      operationId: getApiKeyUsage
+      summary: Usage for one key
+      x-required-role: developer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Aggregated usage.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyUsage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/models:
+    get:
+      tags: [Registry]
+      operationId: listModels
+      summary: List models (own org plus global catalogue)
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: family
+          in: query
+          schema:
+            type: string
+        - name: include_archived
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Models.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPage'
+    post:
+      tags: [Registry]
+      operationId: registerModel
+      summary: Register a model
+      x-required-role: ml_engineer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelCreate'
+      responses:
+        '201':
+          description: Registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/models/{id}:
+    get:
+      tags: [Registry]
+      operationId: getModel
+      summary: Get a model
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Registry]
+      operationId: updateModel
+      summary: Update model metadata
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                description:
+                  type: string
+                license:
+                  type: string
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/models/{id}/archive:
+    post:
+      tags: [Registry]
+      operationId: archiveModel
+      summary: Archive a model
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Archived.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/models/{id}/versions:
+    get:
+      tags: [Registry]
+      operationId: listModelVersions
+      summary: List versions of a model
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Versions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersionPage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Registry]
+      operationId: createModelVersion
+      summary: Register a new version
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelVersionCreate'
+      responses:
+        '201':
+          description: Registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersion'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/models/{id}/versions/{v}/rollback:
+    post:
+      tags: [Registry]
+      operationId: rollbackModelVersion
+      summary: Re-activate an older version
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/VersionNumber'
+      responses:
+        '200':
+          description: Version re-activated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersion'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/models/{id}/versions/{v}:
+    patch:
+      tags: [Registry]
+      operationId: updateModelVersion
+      summary: Update benchmark scores or status
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/VersionNumber'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                benchmark_scores:
+                  type: object
+                  additionalProperties:
+                    type: number
+                status:
+                  $ref: '#/components/schemas/VersionStatus'
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersion'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/deployments:
+    get:
+      tags: [Deployments]
+      operationId: listDeployments
+      summary: List deployments
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/DeployStatus'
+      responses:
+        '200':
+          description: Deployments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentPage'
+    post:
+      tags: [Deployments]
+      operationId: createDeployment
+      summary: Create a deployment
+      x-required-role: ml_engineer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentCreate'
+      responses:
+        '202':
+          description: Accepted; status starts at `pending`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/deployments/{id}:
+    get:
+      tags: [Deployments]
+      operationId: getDeployment
+      summary: Get a deployment
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Deployments]
+      operationId: updateDeployment
+      summary: Update replicas range or vLLM arguments
+      description: Changing `vllm_args` triggers a rolling restart.
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentUpdate'
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Deployments]
+      operationId: deleteDeployment
+      summary: Delete a deployment
+      description: Fails with 409 while the deployment has non-zero route weight.
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '204':
+          description: Deleted.
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/deployments/{id}/start:
+    post:
+      tags: [Deployments]
+      operationId: startDeployment
+      summary: Start a stopped deployment
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/deployments/{id}/stop:
+    post:
+      tags: [Deployments]
+      operationId: stopDeployment
+      summary: Stop a deployment (releases GPUs)
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/deployments/{id}/scale:
+    post:
+      tags: [Deployments]
+      operationId: scaleDeployment
+      summary: Change replica bounds
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [replicas_min, replicas_max]
+              properties:
+                replicas_min:
+                  type: integer
+                  minimum: 0
+                replicas_max:
+                  type: integer
+                  minimum: 1
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/deployments/{id}/rollback:
+    post:
+      tags: [Deployments]
+      operationId: rollbackDeployment
+      summary: Roll back to `previous_deployment_id`
+      description: Shifts route weight back to the previous deployment; the failed one is stopped.
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '202':
+          description: Accepted; status becomes `rolling_back`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/endpoints:
+    get:
+      tags: [Deployments]
+      operationId: listEndpoints
+      summary: List endpoint aliases with their routes
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Endpoints.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointPage'
+    post:
+      tags: [Deployments]
+      operationId: createEndpoint
+      summary: Create an endpoint alias
+      x-required-role: ml_engineer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EndpointCreate'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Endpoint'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/endpoints/{id}/routes:
+    put:
+      tags: [Deployments]
+      operationId: setEndpointRoutes
+      summary: Replace the weighted routes of an endpoint
+      description: Weights are integers 0-100 and must sum to 100; otherwise 422. Enables A/B tests and canaries.
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [routes]
+              properties:
+                routes:
+                  type: array
+                  minItems: 1
+                  items:
+                    $ref: '#/components/schemas/Route'
+      responses:
+        '200':
+          description: Routes replaced.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Endpoint'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/datasets:
+    get:
+      tags: [Fine-tuning]
+      operationId: listDatasets
+      summary: List datasets
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: purpose
+          in: query
+          schema:
+            type: string
+            enum: [finetune, eval]
+      responses:
+        '200':
+          description: Datasets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetPage'
+    post:
+      tags: [Fine-tuning]
+      operationId: uploadDataset
+      summary: Upload a dataset (multipart)
+      x-required-role: ml_engineer
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, name]
+              properties:
+                file:
+                  type: string
+                  contentEncoding: binary
+                  description: jsonl, csv or parquet.
+                name:
+                  type: string
+                purpose:
+                  type: string
+                  enum: [finetune, eval]
+                  default: finetune
+                project_id:
+                  type: string
+                  format: uuid
+      responses:
+        '201':
+          description: Stored and validated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dataset'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/training-jobs:
+    get:
+      tags: [Fine-tuning]
+      operationId: listTrainingJobs
+      summary: List training jobs
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+      responses:
+        '200':
+          description: Jobs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJobPage'
+    post:
+      tags: [Fine-tuning]
+      operationId: createTrainingJob
+      summary: Start a fine-tuning job
+      x-required-role: ml_engineer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainingJobCreate'
+      responses:
+        '202':
+          description: Queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '402':
+          $ref: '#/components/responses/QuotaExceeded'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/training-jobs/{id}:
+    get:
+      tags: [Fine-tuning]
+      operationId: getTrainingJob
+      summary: Get a training job
+      x-proposed: true
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/training-jobs/{id}/metrics:
+    get:
+      tags: [Fine-tuning]
+      operationId: getTrainingJobMetrics
+      summary: Loss curve and training metrics
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - name: since_step
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Metric points ordered by step.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TrainingMetric'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/training-jobs/{id}/cancel:
+    post:
+      tags: [Fine-tuning]
+      operationId: cancelTrainingJob
+      summary: Cancel a queued or running job
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '202':
+          description: Cancellation requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/rag/indexes:
+    get:
+      tags: [RAG]
+      operationId: listRagIndexes
+      summary: List RAG indexes
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Indexes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagIndexPage'
+    post:
+      tags: [RAG]
+      operationId: createRagIndex
+      summary: Create a RAG index
+      x-required-role: ml_engineer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RagIndexCreate'
+      responses:
+        '202':
+          description: Accepted; status `creating`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagIndex'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/rag/indexes/{id}:
+    get:
+      tags: [RAG]
+      operationId: getRagIndex
+      summary: Get a RAG index with its documents summary
+      x-proposed: true
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The index.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagIndex'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/rag/indexes/{id}/documents:
+    get:
+      tags: [RAG]
+      operationId: listRagDocuments
+      summary: List documents in an index
+      x-proposed: true
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Documents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagDocumentPage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [RAG]
+      operationId: uploadRagDocuments
+      summary: Upload documents for ingestion
+      x-required-role: ml_engineer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    contentEncoding: binary
+      responses:
+        '202':
+          description: Accepted; each document starts `queued`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RagDocument'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+  /api/v1/rag/indexes/{id}/query:
+    post:
+      tags: [RAG]
+      operationId: queryRagIndex
+      summary: Retrieve (and optionally generate)
+      x-required-role: developer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RagQueryRequest'
+      responses:
+        '200':
+          description: Passages, with an answer when `generate` is true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagQueryResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/evaluations:
+    get:
+      tags: [Evaluation]
+      operationId: listEvaluations
+      summary: List evaluations
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Evaluations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationPage'
+    post:
+      tags: [Evaluation]
+      operationId: createEvaluation
+      summary: Start an evaluation
+      x-required-role: ml_engineer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluationCreate'
+      responses:
+        '202':
+          description: Queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Evaluation'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/evaluations/compare:
+    get:
+      tags: [Evaluation]
+      operationId: compareEvaluations
+      summary: Compare evaluations side by side
+      x-required-role: viewer
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          description: Comma-separated evaluation ids (2 to 5).
+          schema:
+            type: string
+            examples: ['3f2c...,9ab1...']
+      responses:
+        '200':
+          description: Aligned metric table.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationComparison'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/evaluations/{id}:
+    get:
+      tags: [Evaluation]
+      operationId: getEvaluation
+      summary: Get an evaluation
+      x-proposed: true
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The evaluation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Evaluation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/evaluations/{id}/results:
+    get:
+      tags: [Evaluation]
+      operationId: getEvaluationResults
+      summary: Per-model results
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: One result per evaluated model version.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EvaluationResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/monitoring/overview:
+    get:
+      tags: [Monitoring]
+      operationId: getMonitoringOverview
+      summary: Org-wide serving overview
+      x-required-role: viewer
+      parameters:
+        - name: window
+          in: query
+          schema:
+            type: string
+            enum: [15m, 1h, 6h, 24h, 7d, 30d]
+            default: 1h
+      responses:
+        '200':
+          description: Overview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MonitoringOverview'
+  /api/v1/monitoring/deployments/{id}:
+    get:
+      tags: [Monitoring]
+      operationId: getDeploymentMonitoring
+      summary: Metrics for one deployment
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - name: window
+          in: query
+          schema:
+            type: string
+            enum: [15m, 1h, 6h, 24h, 7d, 30d]
+            default: 1h
+      responses:
+        '200':
+          description: Time series and current values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentMonitoring'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/monitoring/stream:
+    get:
+      tags: [Monitoring]
+      operationId: monitoringStream
+      summary: WebSocket stream of real-time metrics
+      description: |
+        Upgrade to WebSocket (`Connection: Upgrade`, `Upgrade: websocket`). Browsers cannot set an `Authorization`
+        header on a WebSocket; the access token is sent as the first client message
+        `{"type":"auth","token":"<jwt>"}` (**Proposed**; alternative is a short-lived `?ticket=` query parameter).
+        Server messages are JSON objects of schema `MonitoringStreamMessage`, one per second per subscribed deployment.
+      x-required-role: viewer
+      x-websocket: true
+      parameters:
+        - name: deployment_id
+          in: query
+          required: false
+          description: Subscribe to one deployment; omit for org overview.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '101':
+          description: Switching protocols.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/cost/summary:
+    get:
+      tags: [Cost]
+      operationId: getCostSummary
+      summary: Cost summary grouped by a dimension
+      description: '`group_by=org` is allowed only for `platform_admin`; org-level cost reports require `org_admin`.'
+      x-required-role: org_admin
+      parameters:
+        - name: group_by
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [project, deployment, model, org]
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Cost rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostSummary'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/cost/report.csv:
+    get:
+      tags: [Cost]
+      operationId: downloadCostReport
+      summary: Cost report as CSV
+      x-required-role: org_admin
+      parameters:
+        - name: group_by
+          in: query
+          schema:
+            type: string
+            enum: [project, deployment, model, org]
+            default: project
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: CSV with header `day,org_id,project_id,deployment_id,resource,quantity,usd`.
+          content:
+            text/csv:
+              schema:
+                type: string
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/audit-logs:
+    get:
+      tags: [Audit]
+      operationId: listAuditLogs
+      summary: Audit log (tamper-evident, append-only)
+      x-required-role: org_admin
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: actor_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Audit entries, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from `/api/v1/auth/login` (15 minutes). Claims `sub`, `org`, `role`, `exp`, `iat`, `jti`.
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    VersionNumber:
+      name: v
+      in: path
+      required: true
+      description: Integer version number (`model_versions.version`).
+      schema:
+        type: integer
+        minimum: 1
+    OAuthProvider:
+      name: provider
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [azure_ad, google, github]
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous `next_cursor`.
+      schema:
+        type: string
+    From:
+      name: from
+      in: query
+      description: Inclusive start (ISO 8601 date or date-time).
+      schema:
+        type: string
+        format: date-time
+    To:
+      name: to
+      in: query
+      description: Exclusive end (ISO 8601 date or date-time).
+      schema:
+        type: string
+        format: date-time
+  headers:
+    XRequestID:
+      description: Request id.
+      schema:
+        type: string
+  responses:
+    Unauthorized:
+      description: Missing, expired or invalid token / credentials.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Authenticated but the role is insufficient, or the resource belongs to another organization.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource does not exist in the caller's organization (cross-tenant ids also return 404).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: State conflict (duplicate slug/alias, illegal state transition).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationError:
+      description: Request body or parameters failed validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: Upload exceeds the size limit.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    QuotaExceeded:
+      description: A quota (for example `max_gpu_hours` or monthly budget) would be exceeded.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Too many attempts.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem details.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: Problem type URI, `https://slm-studio.dev/problems/<code>` in the implemented services.
+          examples: ['https://slm-studio.dev/problems/not_found']
+        code:
+          type: string
+          description: Stable machine-readable code (extension member), for example `validation_error`, `not_found`, `conflict`, `unauthorized`.
+        param:
+          type: string
+          description: Offending request parameter when applicable (extension member).
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        request_id:
+          type: string
+        errors:
+          type: array
+          description: Field-level validation errors (422).
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items:
+                  type: string
+              msg:
+                type: string
+              type:
+                type: string
+      additionalProperties: true
+    NextCursor:
+      type: [string, 'null']
+      description: Opaque cursor for the next page, null on the last page.
+    OrgRole:
+      type: string
+      enum: [org_admin, ml_engineer, developer, viewer]
+    VersionStatus:
+      type: string
+      enum: [registered, active, archived]
+    DeployStatus:
+      type: string
+      enum: [pending, provisioning, running, stopped, failed, rolling_back]
+    JobStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled]
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in:
+          type: integer
+          description: Access token lifetime in seconds (900).
+        token_type:
+          type: string
+          enum: [bearer]
+    RegisterRequest:
+      type: object
+      required: [email, password, display_name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 12
+        display_name:
+          type: string
+        org_name:
+          type: string
+          description: If present, a new organization is created and the user becomes its `org_admin`.
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+        mfa_code:
+          type: string
+          description: TOTP code when MFA is enabled (Proposed).
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    Membership:
+      type: object
+      required: [org_id, org_name, org_slug, role]
+      properties:
+        org_id:
+          type: string
+          format: uuid
+        org_name:
+          type: string
+        org_slug:
+          type: string
+        role:
+          $ref: '#/components/schemas/OrgRole'
+    Me:
+      type: object
+      required: [id, email, display_name, is_platform_admin, memberships]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        is_platform_admin:
+          type: boolean
+        active_org_id:
+          type: [string, 'null']
+          format: uuid
+        memberships:
+          type: array
+          items:
+            $ref: '#/components/schemas/Membership'
+    Member:
+      type: object
+      required: [user_id, email, display_name, role, created_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        role:
+          $ref: '#/components/schemas/OrgRole'
+        created_at:
+          type: string
+          format: date-time
+    AddMemberRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/OrgRole'
+        display_name:
+          type: string
+    MemberPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Member'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    Project:
+      type: object
+      required: [id, org_id, slug, name, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        name:
+          type: string
+        description:
+          type: [string, 'null']
+        created_by:
+          type: [string, 'null']
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ProjectCreate:
+      type: object
+      required: [slug, name]
+      properties:
+        slug:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{1,62}$'
+        name:
+          type: string
+        description:
+          type: string
+    ProjectUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+    ProjectPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Project'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    ApiKey:
+      type: object
+      required: [id, scope, name, prefix, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        scope:
+          type: string
+          enum: [organization, project]
+        project_id:
+          type: [string, 'null']
+          format: uuid
+        name:
+          type: string
+        prefix:
+          type: string
+          description: Display prefix, for example `slm_a1b2`.
+        rate_limit_rpm:
+          type: [integer, 'null']
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+        rotated_from:
+          type: [string, 'null']
+          format: uuid
+        grace_until:
+          type: [string, 'null']
+          format: date-time
+        last_used_at:
+          type: [string, 'null']
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    ApiKeyWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/ApiKey'
+        - type: object
+          required: [key]
+          properties:
+            key:
+              type: string
+              description: Plaintext key `slm_<prefix>_<secret>`. Returned once; not recoverable.
+    ApiKeyCreate:
+      type: object
+      required: [name, scope]
+      properties:
+        name:
+          type: string
+        scope:
+          type: string
+          enum: [organization, project]
+        project_id:
+          type: string
+          format: uuid
+          description: Required when scope is `project`.
+        rate_limit_rpm:
+          type: integer
+          minimum: 1
+        expires_at:
+          type: string
+          format: date-time
+    ApiKeyPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiKey'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    ApiKeyUsage:
+      type: object
+      required: [api_key_id, requests, prompt_tokens, completion_tokens]
+      properties:
+        api_key_id:
+          type: string
+          format: uuid
+        requests:
+          type: integer
+        errors:
+          type: integer
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        last_used_at:
+          type: [string, 'null']
+          format: date-time
+        series:
+          type: array
+          items:
+            type: object
+            properties:
+              bucket:
+                type: string
+                format: date-time
+              requests:
+                type: integer
+              tokens:
+                type: integer
+    Model:
+      type: object
+      required: [id, name, source, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: [string, 'null']
+          format: uuid
+          description: Null for the global catalogue.
+        name:
+          type: string
+        family:
+          type: [string, 'null']
+        description:
+          type: [string, 'null']
+        license:
+          type: [string, 'null']
+        source:
+          type: string
+          enum: [huggingface, upload, finetune]
+        hf_repo:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+        archived_at:
+          type: [string, 'null']
+          format: date-time
+    ModelCreate:
+      type: object
+      required: [name, source]
+      properties:
+        name:
+          type: string
+        family:
+          type: string
+        description:
+          type: string
+        license:
+          type: string
+        source:
+          type: string
+          enum: [huggingface, upload, finetune]
+        hf_repo:
+          type: string
+    ModelPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    ModelVersion:
+      type: object
+      required: [id, model_id, version, status, format, artifact_uri]
+      properties:
+        id:
+          type: string
+          format: uuid
+        model_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+        status:
+          $ref: '#/components/schemas/VersionStatus'
+        format:
+          type: string
+          enum: [hf, safetensors, gguf]
+        param_count:
+          type: [integer, 'null']
+        quantization:
+          type: [string, 'null']
+        context_length:
+          type: [integer, 'null']
+        artifact_uri:
+          type: string
+        artifact_sha256:
+          type: [string, 'null']
+        base_version_id:
+          type: [string, 'null']
+          format: uuid
+        training_job_id:
+          type: [string, 'null']
+          format: uuid
+        mlflow_run_id:
+          type: [string, 'null']
+        benchmark_scores:
+          type: object
+          additionalProperties:
+            type: number
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    ModelVersionCreate:
+      type: object
+      required: [format, artifact_uri]
+      properties:
+        format:
+          type: string
+          enum: [hf, safetensors, gguf]
+        artifact_uri:
+          type: string
+          description: '`s3://...` or `hf://...`.'
+        artifact_sha256:
+          type: string
+        param_count:
+          type: integer
+        quantization:
+          type: string
+        context_length:
+          type: integer
+        base_version_id:
+          type: string
+          format: uuid
+        metadata:
+          type: object
+          additionalProperties: true
+    ModelVersionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelVersion'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    VllmArgs:
+      type: object
+      description: Whitelisted vLLM options (CONTRACT.md section 6). Unknown keys are rejected with 422.
+      properties:
+        max_model_len:
+          type: integer
+        gpu_memory_utilization:
+          type: number
+          minimum: 0.1
+          maximum: 0.95
+        enable_prefix_caching:
+          type: boolean
+        speculative_config:
+          type: object
+          additionalProperties: true
+        max_num_seqs:
+          type: integer
+        max_num_batched_tokens:
+          type: integer
+        quantization:
+          type: string
+        enable_lora:
+          type: boolean
+        lora_modules:
+          type: array
+          items:
+            type: object
+            required: [name, path]
+            properties:
+              name:
+                type: string
+              path:
+                type: string
+      additionalProperties: false
+    Deployment:
+      type: object
+      required: [id, name, model_version_id, kind, target, strategy, status, replicas_min, replicas_max, gpu_count]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: [string, 'null']
+          format: uuid
+        name:
+          type: string
+        model_version_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [private, shared, dedicated]
+        target:
+          type: string
+          enum: [dgx_spark, kubernetes, azure, aws, on_prem]
+        strategy:
+          type: string
+          enum: [direct, blue_green, canary]
+        status:
+          $ref: '#/components/schemas/DeployStatus'
+        replicas_min:
+          type: integer
+        replicas_max:
+          type: integer
+        gpu_count:
+          type: integer
+        vllm_args:
+          $ref: '#/components/schemas/VllmArgs'
+        internal_url:
+          type: [string, 'null']
+        previous_deployment_id:
+          type: [string, 'null']
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        stopped_at:
+          type: [string, 'null']
+          format: date-time
+    DeploymentCreate:
+      type: object
+      required: [name, model_version_id]
+      properties:
+        name:
+          type: string
+        project_id:
+          type: string
+          format: uuid
+        model_version_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [private, shared, dedicated]
+          default: private
+        target:
+          type: string
+          enum: [dgx_spark, kubernetes, azure, aws, on_prem]
+          default: dgx_spark
+        strategy:
+          type: string
+          enum: [direct, blue_green, canary]
+          default: direct
+        replicas_min:
+          type: integer
+          minimum: 0
+          default: 1
+        replicas_max:
+          type: integer
+          minimum: 1
+          default: 1
+        gpu_count:
+          type: integer
+          minimum: 1
+          default: 1
+        vllm_args:
+          $ref: '#/components/schemas/VllmArgs'
+        endpoint_alias:
+          type: string
+          description: Optional; creates or updates the endpoint and routes traffic per `strategy` (Proposed).
+    DeploymentUpdate:
+      type: object
+      properties:
+        replicas_min:
+          type: integer
+          minimum: 0
+        replicas_max:
+          type: integer
+          minimum: 1
+        vllm_args:
+          $ref: '#/components/schemas/VllmArgs'
+    DeploymentPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deployment'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    Route:
+      type: object
+      required: [deployment_id, weight]
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+        weight:
+          type: integer
+          minimum: 0
+          maximum: 100
+        label:
+          type: string
+          examples: [stable, canary, variant-b]
+    Endpoint:
+      type: object
+      required: [id, alias, kind, enabled, routes]
+      properties:
+        id:
+          type: string
+          format: uuid
+        alias:
+          type: string
+        kind:
+          type: string
+          enum: [private, shared, dedicated]
+        enabled:
+          type: boolean
+        routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Route'
+        created_at:
+          type: string
+          format: date-time
+    EndpointCreate:
+      type: object
+      required: [alias]
+      properties:
+        alias:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+        kind:
+          type: string
+          enum: [private, shared, dedicated]
+          default: private
+        enabled:
+          type: boolean
+          default: true
+    EndpointPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Endpoint'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    Dataset:
+      type: object
+      required: [id, name, purpose, format, storage_uri, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: [string, 'null']
+          format: uuid
+        name:
+          type: string
+        purpose:
+          type: string
+          enum: [finetune, eval]
+        format:
+          type: string
+          enum: [jsonl, csv, parquet]
+        storage_uri:
+          type: string
+        row_count:
+          type: [integer, 'null']
+        token_count:
+          type: [integer, 'null']
+        size_bytes:
+          type: [integer, 'null']
+        schema_info:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    DatasetPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Dataset'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    Hyperparams:
+      type: object
+      description: Defaults depend on `method`; unknown keys are rejected.
+      properties:
+        learning_rate:
+          type: number
+          examples: [0.0002]
+        epochs:
+          type: number
+          examples: [3]
+        per_device_batch_size:
+          type: integer
+        gradient_accumulation_steps:
+          type: integer
+        max_seq_len:
+          type: integer
+        lora_r:
+          type: integer
+          examples: [16]
+        lora_alpha:
+          type: integer
+          examples: [32]
+        lora_dropout:
+          type: number
+        target_modules:
+          type: array
+          items:
+            type: string
+        warmup_ratio:
+          type: number
+        eval_split:
+          type: number
+          minimum: 0
+          maximum: 0.5
+        seed:
+          type: integer
+      additionalProperties: false
+    TrainingJob:
+      type: object
+      required: [id, name, base_version_id, dataset_id, method, status, gpu_count, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: [string, 'null']
+          format: uuid
+        name:
+          type: string
+        base_version_id:
+          type: string
+          format: uuid
+        dataset_id:
+          type: string
+          format: uuid
+        method:
+          type: string
+          enum: [lora, qlora, full]
+        hyperparams:
+          $ref: '#/components/schemas/Hyperparams'
+        gpu_count:
+          type: integer
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        k8s_job_name:
+          type: [string, 'null']
+        mlflow_run_id:
+          type: [string, 'null']
+        wandb_run_url:
+          type: [string, 'null']
+        output_version_id:
+          type: [string, 'null']
+          format: uuid
+        tokens_processed:
+          type: integer
+        est_cost_usd:
+          type: [number, 'null']
+        error:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+    TrainingJobCreate:
+      type: object
+      required: [name, base_version_id, dataset_id, hyperparams]
+      properties:
+        name:
+          type: string
+        project_id:
+          type: string
+          format: uuid
+        base_version_id:
+          type: string
+          format: uuid
+        dataset_id:
+          type: string
+          format: uuid
+        method:
+          type: string
+          enum: [lora, qlora, full]
+          default: qlora
+        hyperparams:
+          $ref: '#/components/schemas/Hyperparams'
+        gpu_count:
+          type: integer
+          minimum: 1
+          default: 1
+    TrainingJobPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrainingJob'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    TrainingMetric:
+      type: object
+      required: [step]
+      properties:
+        step:
+          type: integer
+        loss:
+          type: [number, 'null']
+        eval_loss:
+          type: [number, 'null']
+        lr:
+          type: [number, 'null']
+        tokens:
+          type: [integer, 'null']
+        gpu_util:
+          type: [number, 'null']
+        recorded_at:
+          type: string
+          format: date-time
+    RagIndex:
+      type: object
+      required: [id, name, backend, collection, embedding_model, embedding_dim, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: [string, 'null']
+          format: uuid
+        name:
+          type: string
+        backend:
+          type: string
+          enum: [qdrant, weaviate, milvus]
+        collection:
+          type: string
+        embedding_model:
+          type: string
+        embedding_dim:
+          type: integer
+        chunk_size:
+          type: integer
+        chunk_overlap:
+          type: integer
+        hybrid_search:
+          type: boolean
+        reranker_model:
+          type: [string, 'null']
+        status:
+          type: string
+          enum: [creating, ready, failed]
+        doc_count:
+          type: integer
+        chunk_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+    RagIndexCreate:
+      type: object
+      required: [name, embedding_model]
+      properties:
+        name:
+          type: string
+        project_id:
+          type: string
+          format: uuid
+        backend:
+          type: string
+          enum: [qdrant, weaviate, milvus]
+          default: qdrant
+        embedding_model:
+          type: string
+          description: Endpoint alias of an embedding deployment.
+        embedding_dim:
+          type: integer
+          description: Optional; discovered from the embedding endpoint if omitted (Proposed).
+        chunk_size:
+          type: integer
+          default: 512
+        chunk_overlap:
+          type: integer
+          default: 64
+        hybrid_search:
+          type: boolean
+          default: true
+        reranker_model:
+          type: string
+    RagIndexPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RagIndex'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    RagDocument:
+      type: object
+      required: [id, index_id, filename, mime_type, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        index_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        mime_type:
+          type: string
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        chunk_count:
+          type: integer
+        error:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+    RagDocumentPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RagDocument'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    RagQueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 5
+        rerank:
+          type: boolean
+          default: true
+        filters:
+          type: object
+          additionalProperties: true
+          description: Metadata filters (document-level). `org_id` and `index_id` are always added server side and cannot be overridden.
+        generate:
+          type: boolean
+          default: false
+        model:
+          type: string
+          description: Endpoint alias used for generation when `generate` is true.
+    RagPassage:
+      type: object
+      required: [chunk_id, document_id, text, score]
+      properties:
+        chunk_id:
+          type: string
+        document_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        text:
+          type: string
+        score:
+          type: number
+        rerank_score:
+          type: [number, 'null']
+        metadata:
+          type: object
+          additionalProperties: true
+    RagQueryResponse:
+      type: object
+      required: [passages]
+      properties:
+        passages:
+          type: array
+          items:
+            $ref: '#/components/schemas/RagPassage'
+        answer:
+          type: [string, 'null']
+        citations:
+          type: array
+          items:
+            type: string
+            description: chunk_id values cited by the answer.
+        usage:
+          type: object
+          additionalProperties:
+            type: integer
+    Evaluation:
+      type: object
+      required: [id, name, dataset_id, model_version_ids, metrics, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: [string, 'null']
+          format: uuid
+        name:
+          type: string
+        dataset_id:
+          type: string
+          format: uuid
+        model_version_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+        metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/MetricName'
+        judge_model:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+    MetricName:
+      type: string
+      enum: [accuracy, f1, rouge, bleu, hallucination, faithfulness, groundedness, toxicity, json_validity]
+    EvaluationCreate:
+      type: object
+      required: [name, dataset_id, model_version_ids, metrics]
+      properties:
+        name:
+          type: string
+        project_id:
+          type: string
+          format: uuid
+        dataset_id:
+          type: string
+          format: uuid
+        model_version_ids:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            type: string
+            format: uuid
+        metrics:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/MetricName'
+        judge_model:
+          type: string
+          description: Endpoint alias; required when metrics include hallucination, faithfulness or groundedness.
+    EvaluationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evaluation'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    EvaluationResult:
+      type: object
+      required: [model_version_id, scores]
+      properties:
+        model_version_id:
+          type: string
+          format: uuid
+        scores:
+          type: object
+          additionalProperties:
+            type: number
+        latency_p50_ms:
+          type: [integer, 'null']
+        latency_p95_ms:
+          type: [integer, 'null']
+        cost_per_1k_tokens_usd:
+          type: [number, 'null']
+        sample_count:
+          type: [integer, 'null']
+    EvaluationComparison:
+      type: object
+      required: [evaluations, metrics]
+      properties:
+        evaluations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evaluation'
+        metrics:
+          type: array
+          description: One row per metric, one value per (evaluation, model version) column.
+          items:
+            type: object
+            properties:
+              metric:
+                type: string
+              values:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    evaluation_id:
+                      type: string
+                      format: uuid
+                    model_version_id:
+                      type: string
+                      format: uuid
+                    value:
+                      type: [number, 'null']
+    MonitoringOverview:
+      type: object
+      required: [window, requests, error_rate]
+      properties:
+        window:
+          type: string
+        requests:
+          type: integer
+        error_rate:
+          type: number
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        latency_p50_ms:
+          type: [number, 'null']
+        latency_p95_ms:
+          type: [number, 'null']
+        ttft_p95_ms:
+          type: [number, 'null']
+        tokens_per_second:
+          type: [number, 'null']
+        active_deployments:
+          type: integer
+        top_deployments:
+          type: array
+          items:
+            type: object
+            properties:
+              deployment_id:
+                type: string
+                format: uuid
+              name:
+                type: string
+              requests:
+                type: integer
+              p95_ms:
+                type: number
+    TimePoint:
+      type: object
+      required: [t, v]
+      properties:
+        t:
+          type: string
+          format: date-time
+        v:
+          type: [number, 'null']
+    DeploymentMonitoring:
+      type: object
+      required: [deployment_id, window]
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+        window:
+          type: string
+        series:
+          type: object
+          description: Named time series, for example `rps`, `latency_p95_ms`, `ttft_p95_ms`, `tokens_per_second`, `queue_depth`, `kv_cache_usage`, `gpu_util`, `error_rate`.
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/TimePoint'
+        current:
+          type: object
+          additionalProperties:
+            type: number
+    MonitoringStreamMessage:
+      type: object
+      required: [type, ts]
+      properties:
+        type:
+          type: string
+          enum: [overview, deployment, alert, error]
+        ts:
+          type: string
+          format: date-time
+        deployment_id:
+          type: [string, 'null']
+          format: uuid
+        data:
+          type: object
+          additionalProperties: true
+    CostSummary:
+      type: object
+      required: [group_by, from, to, total_usd, rows]
+      properties:
+        group_by:
+          type: string
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        total_usd:
+          type: number
+        rows:
+          type: array
+          items:
+            type: object
+            required: [key, usd]
+            properties:
+              key:
+                type: string
+                description: Id of the grouped entity.
+              label:
+                type: string
+              usd:
+                type: number
+              by_resource:
+                type: object
+                description: usd per resource (`gpu_hour`, `input_token_1k`, ...).
+                additionalProperties:
+                  type: number
+              quantity_by_resource:
+                type: object
+                additionalProperties:
+                  type: number
+    AuditLog:
+      type: object
+      required: [id, actor_type, action, resource, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        org_id:
+          type: [string, 'null']
+          format: uuid
+        actor_id:
+          type: [string, 'null']
+          format: uuid
+        actor_type:
+          type: string
+          enum: [user, api_key, system]
+        action:
+          type: string
+          examples: [api_key.create, deployment.scale]
+        resource:
+          type: string
+        resource_id:
+          type: [string, 'null']
+        ip:
+          type: [string, 'null']
+        request_id:
+          type: [string, 'null']
+        detail:
+          type: object
+          additionalProperties: true
+        prev_hash:
+          type: [string, 'null']
+          description: Hex.
+        row_hash:
+          type: [string, 'null']
+          description: Hex.
+        created_at:
+          type: string
+          format: date-time
+    AuditLogPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditLog'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'

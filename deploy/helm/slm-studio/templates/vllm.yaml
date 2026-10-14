@@ -1,0 +1,354 @@
+{{- /*
+  vLLM model servers (platform-managed models). One StatefulSet + ClusterIP Service + headless Service per model.
+  StatefulSet (not Deployment) so every replica owns a ReadWriteOnce cache PVC (HF weights, torch.compile/Triton caches),
+  which makes cold starts fast and scaling safe on RWO storage. Set vllm.cache.existingClaim for one shared RWX claim.
+  vLLM flags are generated from `args` (see modelDefaults); anything else goes through `extraArgs`.
+*/ -}}
+{{- if .Values.vllm.enabled }}
+{{- range $name, $cfg := .Values.vllm.models }}
+{{- $m := include "slm.vllm.model" (dict "root" $ "name" $name "cfg" $cfg) | fromJson }}
+{{- if $m.enabled }}
+{{- $a := $m.args }}
+{{- $fullname := printf "%s-vllm-%s" (include "slm.fullname" $) $name }}
+{{- $component := printf "vllm-%s" $name }}
+{{- $sel := dict "app.kubernetes.io/name" (include "slm.name" $) "app.kubernetes.io/instance" $.Release.Name "app.kubernetes.io/component" $component }}
+{{- $fromS3 := hasPrefix "s3://" $m.model }}
+{{- $modelArg := ternary (printf "/cache/models/%s" $name) $m.model $fromS3 }}
+{{- $kedaOn := dig "autoscaling" "keda" "enabled" false $m }}
+{{- $req := deepCopy (default (dict) $m.resources.requests) }}
+{{- $_ := set $req "nvidia.com/gpu" ($m.gpu | int) }}
+{{- $lim := deepCopy (default (dict) $m.resources.limits) }}
+{{- $_ := set $lim "nvidia.com/gpu" ($m.gpu | int) }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $component "tier" "inference") | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $component "tier" "inference") | nindent 4 }}
+    slm-studio.io/scrape: vllm
+    slm-studio.io/deployment: {{ $name }}
+  annotations:
+    # Value to store in deployments.internal_url for this model:
+    slm-studio.io/internal-url: {{ printf "http://%s.%s.svc.cluster.local:8000" $fullname $.Release.Namespace | quote }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- toYaml $sel | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-headless
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $component "tier" "inference") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+  selector:
+    {{- toYaml $sel | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $component "tier" "inference") | nindent 4 }}
+    slm-studio.io/deployment: {{ $name }}
+spec:
+  {{- if not $kedaOn }}
+  replicas: {{ $m.replicas | int }}
+  {{- end }}
+  serviceName: {{ $fullname }}-headless
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  revisionHistoryLimit: 3
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      {{- toYaml $sel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slm.componentLabels" (dict "root" $ "component" $component "tier" "inference") | nindent 8 }}
+        slm-studio.io/deployment: {{ $name }}
+        slm-studio.io/egress: external
+      annotations:
+        checksum/model: {{ toJson $m | sha256sum }}
+    spec:
+      serviceAccountName: {{ $fullname }}
+      automountServiceAccountToken: false
+      {{- with $.Values.vllm.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}
+      {{- include "slm.pullSecrets" $ | nindent 6 }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $m.terminationGracePeriodSeconds | int }}
+      {{- if $fromS3 }}
+      initContainers:
+        - name: fetch-model
+          image: {{ $.Values.vllm.s3Fetcher.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              dest="/cache/models/{{ $name }}"
+              marker="$dest/.complete-$(printf '%s' "{{ $m.model }}" | sha256sum | cut -c1-16)"
+              if [ -f "$marker" ]; then echo "model already present"; exit 0; fi
+              mkdir -p "$dest"
+              aws s3 sync "{{ $m.model }}" "$dest" ${S3_ENDPOINT:+--endpoint-url "$S3_ENDPOINT"} --only-show-errors
+              touch "$marker"
+          env:
+            - name: HOME
+              value: /tmp
+            - name: S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "slm.fullname" $ }}-config
+                  key: SLM_S3_ENDPOINT
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "slm.fullname" $ }}-config
+                  key: SLM_S3_REGION
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slm.secretName" $ }}
+                  key: SLM_S3_ACCESS_KEY
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slm.secretName" $ }}
+                  key: SLM_S3_SECRET_KEY
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+            - { name: tmp, mountPath: /tmp }
+      {{- end }}
+      containers:
+        - name: vllm
+          image: {{ printf "%s:%s" $.Values.vllm.image.repository $.Values.vllm.image.tag | quote }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+          command:
+            {{- toYaml $.Values.vllm.command | nindent 12 }}
+          args:
+            - {{ $modelArg | quote }}
+            - --served-model-name
+            - {{ default $name $m.servedModelName | quote }}
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+            {{- with $a.maxModelLen }}
+            - --max-model-len
+            - {{ . | int | quote }}
+            {{- end }}
+            {{- with $a.gpuMemoryUtilization }}
+            - --gpu-memory-utilization
+            - {{ . | quote }}
+            {{- end }}
+            {{- with $a.maxNumSeqs }}
+            - --max-num-seqs
+            - {{ . | int | quote }}
+            {{- end }}
+            {{- with $a.maxNumBatchedTokens }}
+            - --max-num-batched-tokens
+            - {{ . | int | quote }}
+            {{- end }}
+            {{- if gt (int (default 1 $a.tensorParallelSize)) 1 }}
+            - --tensor-parallel-size
+            - {{ $a.tensorParallelSize | int | quote }}
+            {{- end }}
+            {{- with $a.dtype }}
+            - --dtype
+            - {{ . | quote }}
+            {{- end }}
+            {{- with $a.quantization }}
+            - --quantization
+            - {{ . | quote }}
+            {{- end }}
+            {{- if $a.enablePrefixCaching }}
+            - --enable-prefix-caching
+            {{- end }}
+            {{- with $a.speculativeConfig }}
+            - --speculative-config
+            - {{ toJson . | quote }}
+            {{- end }}
+            {{- if $a.enableLora }}
+            - --enable-lora
+            {{- with $a.maxLoras }}
+            - --max-loras
+            - {{ . | int | quote }}
+            {{- end }}
+            {{- with $a.maxLoraRank }}
+            - --max-lora-rank
+            - {{ . | int | quote }}
+            {{- end }}
+            {{- with $a.loraModules }}
+            - --lora-modules
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- range $m.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /tmp
+            - name: HF_HOME
+              value: /cache/hf
+            - name: VLLM_CACHE_ROOT
+              value: /cache/vllm
+            - name: TRITON_CACHE_DIR
+              value: /cache/triton
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /cache/inductor
+            - name: VLLM_NO_USAGE_STATS
+              value: "1"
+            - name: DO_NOT_TRACK
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slm.secretName" $ }}
+                  key: SLM_HF_TOKEN
+                  optional: true
+          resources:
+            requests:
+              {{- toYaml $req | nindent 14 }}
+            limits:
+              {{- toYaml $lim | nindent 14 }}
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 180          # up to 30 min: weight download + compile + CUDA graph capture
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "15"]
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ $.Values.vllm.shmSize }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+        {{- with $.Values.vllm.cache.existingClaim }}
+        - name: cache
+          persistentVolumeClaim:
+            claimName: {{ . }}
+        {{- end }}
+      {{- with $.Values.vllm.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.vllm.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "slm.scheduling" (dict "root" $ "selector" $sel) | nindent 6 }}
+  {{- if not $.Values.vllm.cache.existingClaim }}
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $.Values.vllm.cache.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $m.cache.size }}
+  {{- end }}
+{{- if $kedaOn }}
+{{- $k := $m.autoscaling.keda }}
+---
+# KEDA scales on queue depth (requests waiting in the vLLM scheduler) instead of CPU, which is meaningless for GPU serving.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $component "tier" "inference") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: {{ $fullname }}
+  minReplicaCount: {{ $k.minReplicas | int }}
+  maxReplicaCount: {{ $k.maxReplicas | int }}
+  pollingInterval: 15
+  cooldownPeriod: {{ default 600 $k.cooldownPeriod | int }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - { type: Pods, value: 1, periodSeconds: 120 }
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - { type: Pods, value: 1, periodSeconds: 60 }
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ $.Values.vllm.keda.prometheusAddress | quote }}
+        query: {{ printf "sum(vllm:num_requests_waiting{slm_deployment=%q})" $name | quote }}
+        threshold: {{ default "8" $k.queueDepthThreshold | quote }}
+        activationThreshold: "1"
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

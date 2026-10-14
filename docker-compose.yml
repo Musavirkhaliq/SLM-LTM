@@ -1,0 +1,436 @@
+# SLM Studio - local development stack.
+#
+#   cp .env.example .env            # then edit the passwords (compose refuses to start without them)
+#   docker compose up --build       # data stores + all services + web + observability
+#   docker compose --profile stub up --build      # + CPU-only vLLM stub (no GPU needed)
+#   docker compose --profile vllm up --build      # + real vLLM (NVIDIA GPU + nvidia-container-toolkit)
+#   docker compose --profile gpu up               # + dcgm-exporter (GPU metrics for Grafana)
+#
+# Endpoints (all bound to 127.0.0.1):
+#   web http://localhost:3000   gateway http://localhost:8000   grafana http://localhost:3001
+#   prometheus :9090   mlflow :5000   minio console :9001   qdrant :6333
+#
+# This file is for DEVELOPMENT. Production uses deploy/helm/slm-studio. Training runs as Kubernetes Jobs in
+# production; here the `trainer` profile runs one job from $SLM_JOB_SPEC on the local GPU
+# (docker compose --profile trainer run --rm -e SLM_JOB_SPEC="$(cat job.json)" trainer).
+name: slm-studio
+
+x-slm-env: &slm-env
+  SLM_ENV: dev
+  SLM_LOG_LEVEL: ${SLM_LOG_LEVEL:-INFO}
+  SLM_DATABASE_URL: postgresql://slm_app:${SLM_APP_DB_PASSWORD:?set SLM_APP_DB_PASSWORD in .env}@postgres:5432/slm
+  SLM_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+  SLM_JWT_ALGORITHM: HS256
+  SLM_JWT_SECRET: ${SLM_JWT_SECRET:?set SLM_JWT_SECRET in .env}
+  SLM_OTLP_ENDPOINT: http://otel-collector:4318
+  SLM_S3_ENDPOINT: http://minio:9000
+  SLM_S3_REGION: us-east-1
+  SLM_S3_ACCESS_KEY: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+  SLM_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+  SLM_MLFLOW_URI: http://mlflow:5000
+  SLM_QDRANT_URL: http://qdrant:6333
+  SLM_HF_TOKEN: ${HF_TOKEN:-}
+
+x-service: &service
+  restart: unless-stopped
+  environment: *slm-env
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  depends_on:
+    db-migrate: { condition: service_completed_successfully }
+    redis: { condition: service_healthy }
+    otel-collector: { condition: service_started }
+
+x-build: &build
+  context: .
+  dockerfile: deploy/docker/Dockerfile.service
+
+services:
+  # ------------------------------------------------------------------ data stores
+  postgres:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      SLM_MIGRATOR_DB_PASSWORD: ${SLM_MIGRATOR_DB_PASSWORD:?set SLM_MIGRATOR_DB_PASSWORD in .env}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:?set MLFLOW_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Single source of truth: the same script bootstraps the Helm chart's bundled dev Postgres.
+      - ./deploy/helm/slm-studio/files/postgres-init.sh:/docker-entrypoint-initdb.d/10-slm-init.sh:ro
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d slm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  db-migrate:
+    build:
+      <<: *build
+      args: { SERVICE: auth, PORT: "8001" }
+    image: slm-studio/auth:${TAG:-dev}
+    command: ["python", "/app/db/migrate.py"]
+    restart: "no"
+    environment:
+      # Owner role: creates schema/extensions and (via db/migrate.py) the runtime role slm_app with the password below.
+      # Services themselves connect as the non-owner slm_app, so row-level security is enforced.
+      SLM_MIGRATE_DATABASE_URL: postgresql://slm_migrator:${SLM_MIGRATOR_DB_PASSWORD:?set SLM_MIGRATOR_DB_PASSWORD in .env}@postgres:5432/slm
+      SLM_APP_PASSWORD: ${SLM_APP_DB_PASSWORD}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  redis:
+    image: redis:7.4.1-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes: [redisdata:/data]
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes: [miniodata:/data]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    restart: "no"
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        for b in models datasets rag-documents checkpoints reports mlflow-artifacts; do
+          mc mb --ignore-existing "local/$$b"
+        done
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    volumes: [qdrantdata:/qdrant/storage]
+    ports: ["127.0.0.1:6333:6333"]
+    healthcheck:
+      # image ships neither curl nor wget: plain TCP check via bash
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.mlflow
+    image: slm-studio/mlflow:${TAG:-dev}
+    restart: unless-stopped
+    command:
+      - --backend-store-uri
+      - postgresql://mlflow:${MLFLOW_DB_PASSWORD}@postgres:5432/mlflow
+      - --artifacts-destination
+      - s3://mlflow-artifacts
+      - --serve-artifacts
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:5000:5000"]
+
+  # ------------------------------------------------------------------ observability
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./deploy/grafana/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    # scratch-based image: no shell, so no container healthcheck; dependants use service_started.
+    expose: ["4317", "4318", "8888", "8889", "13133"]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/grafana/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/grafana/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - promdata:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      prometheus: { condition: service_healthy }
+    ports: ["127.0.0.1:3001:3000"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # ------------------------------------------------------------------ control plane
+  auth:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: auth, PORT: "8001" } }
+    image: slm-studio/auth:${TAG:-dev}
+    expose: ["8001"]
+
+  registry:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: registry, PORT: "8002" } }
+    image: slm-studio/registry:${TAG:-dev}
+    expose: ["8002"]
+    depends_on:
+      db-migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+      otel-collector: { condition: service_started }
+
+  finetune:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: finetune, PORT: "8003" } }
+    image: slm-studio/finetune:${TAG:-dev}
+    expose: ["8003"]
+    depends_on:
+      db-migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+      mlflow: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+
+  rag:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: rag, PORT: "8004" } }
+    image: slm-studio/rag:${TAG:-dev}
+    expose: ["8004"]
+    depends_on:
+      db-migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+      qdrant: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+
+  evaluation:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: evaluation, PORT: "8005" } }
+    image: slm-studio/evaluation:${TAG:-dev}
+    expose: ["8005"]
+
+  deployment:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: deployment, PORT: "8006" } }
+    image: slm-studio/deployment:${TAG:-dev}
+    expose: ["8006"]
+
+  monitoring:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: monitoring, PORT: "8007" } }
+    image: slm-studio/monitoring:${TAG:-dev}
+    expose: ["8007"]
+
+  cost:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: cost, PORT: "8008" } }
+    image: slm-studio/cost:${TAG:-dev}
+    expose: ["8008"]
+
+  gateway:
+    <<: *service
+    build: { <<: *build, args: { SERVICE: gateway, PORT: "8000" } }
+    image: slm-studio/gateway:${TAG:-dev}
+    environment:
+      <<: *slm-env
+      SLM_AUTH_URL: http://auth:8001
+      SLM_REGISTRY_URL: http://registry:8002
+      SLM_FINETUNE_URL: http://finetune:8003
+      SLM_RAG_URL: http://rag:8004
+      SLM_EVALUATION_URL: http://evaluation:8005
+      SLM_DEPLOYMENT_URL: http://deployment:8006
+      SLM_MONITORING_URL: http://monitoring:8007
+      SLM_COST_URL: http://cost:8008
+    depends_on:
+      db-migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+      auth: { condition: service_healthy }
+      registry: { condition: service_healthy }
+      finetune: { condition: service_healthy }
+      rag: { condition: service_healthy }
+      evaluation: { condition: service_healthy }
+      deployment: { condition: service_healthy }
+      monitoring: { condition: service_healthy }
+      cost: { condition: service_healthy }
+    ports: ["127.0.0.1:8000:8000"]
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.web
+      args:
+        # Inlined into the browser bundle at build time: the browser talks to the gateway on localhost.
+        # NOTE: the gateway has no CORS middleware yet, so a browser cross-origin call from :3000 to :8000 is
+        # blocked unless a same-origin proxy or CORS support is added (ingress-nginx CORS annotations do this on K8s).
+        NEXT_PUBLIC_API_BASE: http://localhost:8000
+        NEXT_PUBLIC_USE_MOCKS: "false"
+    image: slm-studio/web:${TAG:-dev}
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    read_only: true
+    tmpfs: ["/tmp", "/app/.next/cache"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      gateway: { condition: service_healthy }
+    ports: ["127.0.0.1:3000:3000"]
+
+  # ------------------------------------------------------------------ inference (optional)
+  # CPU-only mock of a vLLM server. Register a deployment whose internal_url is http://vllm-stub:8000.
+  vllm-stub:
+    profiles: [stub]
+    image: python:3.12.8-slim-bookworm
+    restart: unless-stopped
+    command: ["python", "/srv/server.py"]
+    environment:
+      STUB_MODEL: ${VLLM_SERVED_NAME:-phi-4-mini}
+      PORT: "8000"
+    volumes:
+      - ./deploy/compose/vllm-stub:/srv:ro
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    expose: ["8000"]
+
+  # Real vLLM on an NVIDIA GPU (needs nvidia-container-toolkit; `runtime: nvidia` must be registered
+  # in the Docker daemon: `nvidia-ctk runtime configure --runtime=docker`). Register a deployment with
+  # internal_url http://vllm:8000. On DGX Spark use NVIDIA's arm64 image (nvcr.io/nvidia/vllm) via VLLM_IMAGE.
+  vllm:
+    profiles: [vllm]
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.10.2}
+    restart: unless-stopped
+    runtime: nvidia
+    ipc: host
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_TOKEN: ${HF_TOKEN:-}
+    command:
+      - --model
+      - ${VLLM_MODEL:-microsoft/Phi-4-mini-instruct}
+      - --served-model-name
+      - ${VLLM_SERVED_NAME:-phi-4-mini}
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-8192}"
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+      - --enable-prefix-caching
+    volumes:
+      - hfcache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+    expose: ["8000"]
+
+  dcgm-exporter:
+    profiles: [gpu]
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+    restart: unless-stopped
+    runtime: nvidia
+    cap_add: [SYS_ADMIN]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    expose: ["9400"]
+
+  # One-off local training run: docker compose --profile trainer run --rm -e SLM_JOB_SPEC="$(cat job.json)" trainer
+  trainer:
+    profiles: [trainer]
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.trainer
+    image: slm-studio/trainer:${TAG:-dev}
+    restart: "no"
+    runtime: nvidia
+    ipc: host
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      SLM_JOB_SPEC: ${SLM_JOB_SPEC:-}
+      SLM_S3_ENDPOINT: http://minio:9000
+      SLM_S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      SLM_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      SLM_MLFLOW_URI: http://mlflow:5000
+      SLM_TRAINING_API_URL: http://finetune:8003
+      SLM_TRAINER_TOKEN: ${SLM_TRAINER_TOKEN:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+    read_only: true
+    tmpfs: ["/tmp", "/work:uid=10001,gid=10001,size=64g"]
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+      mlflow: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  qdrantdata:
+  promdata:
+  grafanadata:
+  hfcache:

@@ -1,0 +1,27 @@
+SLM Studio {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+{{- if .Values.ingress.enabled }}
+
+  API / OpenAI-compatible endpoint : https://{{ .Values.ingress.api.host }}/v1   (control plane: /api/v1)
+  Web console                      : https://{{ .Values.ingress.app.host }}
+{{- else }}
+
+  Ingress is disabled. Reach the gateway with:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "slm.fullname" . }}-gateway {{ .Values.services.gateway.port }}:{{ .Values.services.gateway.port }}
+{{- end }}
+
+Checks:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "slm.fullname" . }}-gateway
+  curl -fsS https://{{ .Values.ingress.api.host }}/readyz
+{{- if .Values.vllm.enabled }}
+
+vLLM model servers (cold start downloads weights; allow several minutes):
+{{- range $name, $cfg := .Values.vllm.models }}
+  kubectl -n {{ $.Release.Namespace }} get pods -l app.kubernetes.io/component=vllm-{{ $name }}
+  deployments.internal_url = http://{{ include "slm.fullname" $ }}-vllm-{{ $name }}.{{ $.Release.Namespace }}.svc.cluster.local:8000
+{{- end }}
+{{- end }}
+{{- if and .Values.secrets.externalSecret.enabled (not .Values.secrets.existingSecret) }}
+
+Secrets come from External Secrets Operator (store: {{ .Values.secrets.externalSecret.secretStoreRef.name }}):
+  kubectl -n {{ .Release.Namespace }} get externalsecret
+{{- end }}

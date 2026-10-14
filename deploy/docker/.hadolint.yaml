@@ -1,0 +1,12 @@
+# Used by CI: hadolint --config deploy/docker/.hadolint.yaml <Dockerfile>
+failure-threshold: warning
+ignored:
+  - DL3006   # base image tags come from ARG (pinned via ARG defaults); hadolint cannot resolve them
+  - DL3008   # apt packages come from the pinned distro snapshot of the pinned base image
+  - DL3018   # same for apk
+  - DL3059   # separate RUNs are intentional for layer caching
+  - SC1091
+trustedRegistries:
+  - docker.io
+  - ghcr.io
+  - nvcr.io

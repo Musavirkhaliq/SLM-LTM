@@ -1,0 +1,920 @@
+openapi: 3.1.0
+info:
+  title: SLM Studio Inference API
+  version: 0.1.0
+  summary: OpenAI-compatible inference API served by the SLM Studio gateway (port 8000).
+  description: |
+    Drop-in compatible with the OpenAI SDKs for chat completions, completions, embeddings and model listing.
+    Point an SDK at `https://<host>/v1` and use an SLM Studio API key as the bearer token.
+
+    **Model resolution.** The `model` field is an *endpoint alias* (table `endpoints`), not a Hugging Face id.
+    The gateway resolves it to weighted routes (A/B, canary) and picks a running deployment. Aliases of the
+    global shared catalogue also resolve.
+
+    **Auth.** `Authorization: Bearer slm_<8 char prefix>_<40 char secret>`. Keys are scoped to an organization or a
+    project. Rotated keys keep working until their grace period ends.
+
+    **Errors.** All errors on `/v1/*` use the OpenAI-shaped envelope `{"error": {"message", "type", "code"}}`
+    (this differs from the control plane, which uses RFC 7807 problem+json).
+
+    **Rate limit headers** follow the OpenAI naming convention (`x-ratelimit-limit-requests`, `-remaining-requests`,
+    `-reset-requests`, `-limit-tokens`, `-remaining-tokens`, `-reset-tokens`), as emitted by the gateway (verified
+    against `services/gateway/src/slm_gateway/limits.py`).
+
+    **Streaming.** With `stream: true` the response is `text/event-stream`; each event is
+    `data: <ChatCompletionChunk JSON>` and the stream ends with `data: [DONE]`. The gateway passes the
+    upstream vLLM stream through untouched. Token usage in a stream is only present when
+    `stream_options.include_usage` is true (the gateway enables it upstream for metering regardless).
+
+    Fields not listed below that vLLM supports (for example `top_k`, `min_p`, `repetition_penalty`, `guided_json`,
+    `guided_regex`, `chat_template_kwargs`) are forwarded as-is where the upstream accepts them; they are not
+    guaranteed by this contract.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://localhost:8000
+    description: Local development (docker compose / DGX Spark)
+  - url: https://api.slm.example.com
+    description: Example production host
+security:
+  - apiKey: []
+tags:
+  - name: Chat
+  - name: Completions
+  - name: Embeddings
+  - name: Models
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [Chat]
+      operationId: createChatCompletion
+      summary: Create a chat completion
+      description: Streaming and non-streaming. Authenticated with an API key of scope `organization` or `project`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+            examples:
+              simple:
+                summary: Non-streaming
+                value:
+                  model: phi-4-mini
+                  messages:
+                    - role: system
+                      content: You are a concise assistant.
+                    - role: user
+                      content: Explain KV caching in one sentence.
+                  max_tokens: 128
+                  temperature: 0.2
+              streaming:
+                summary: Streaming with usage
+                value:
+                  model: phi-4-mini
+                  messages:
+                    - role: user
+                      content: Write a haiku about GPUs.
+                  stream: true
+                  stream_options:
+                    include_usage: true
+      responses:
+        '200':
+          description: A completion, or a stream of chunks when `stream` is true.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-SLM-Route:
+              $ref: '#/components/headers/XSLMRoute'
+            X-RateLimit-Limit-Requests:
+              $ref: '#/components/headers/RateLimitLimitRequests'
+            X-RateLimit-Remaining-Requests:
+              $ref: '#/components/headers/RateLimitRemainingRequests'
+            X-RateLimit-Limit-Tokens:
+              $ref: '#/components/headers/RateLimitLimitTokens'
+            X-RateLimit-Remaining-Tokens:
+              $ref: '#/components/headers/RateLimitRemainingTokens'
+            X-RateLimit-Reset-Requests:
+              $ref: '#/components/headers/RateLimitResetRequests'
+            X-RateLimit-Reset-Tokens:
+              $ref: '#/components/headers/RateLimitResetTokens'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/SSEStream'
+              examples:
+                stream:
+                  summary: Wire format
+                  value: |
+                    data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"phi-4-mini","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+                    data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"phi-4-mini","choices":[{"index":0,"delta":{"content":"Silicon"},"finish_reason":null}]}
+
+                    data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"phi-4-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+                    data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"phi-4-mini","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":42,"total_tokens":60}}
+
+                    data: [DONE]
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/ModelNotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+        '504':
+          $ref: '#/components/responses/UpstreamTimeout'
+  /v1/completions:
+    post:
+      tags: [Completions]
+      operationId: createCompletion
+      summary: Create a text completion (legacy)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompletionRequest'
+      responses:
+        '200':
+          description: A completion, or a stream of chunks when `stream` is true.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-SLM-Route:
+              $ref: '#/components/headers/XSLMRoute'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompletionResponse'
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/SSEStream'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/ModelNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+        '504':
+          $ref: '#/components/responses/UpstreamTimeout'
+  /v1/embeddings:
+    post:
+      tags: [Embeddings]
+      operationId: createEmbedding
+      summary: Create embeddings
+      description: The alias must resolve to a deployment serving an embedding (pooling) model.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmbeddingRequest'
+      responses:
+        '200':
+          description: Embedding vectors.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmbeddingResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/ModelNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+        '504':
+          $ref: '#/components/responses/UpstreamTimeout'
+  /v1/models:
+    get:
+      tags: [Models]
+      operationId: listModels
+      summary: List endpoint aliases visible to the caller
+      description: Returns the caller's own enabled endpoint aliases plus shared-catalogue aliases. `id` is the value to put in the `model` field.
+      responses:
+        '200':
+          description: Model list.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/ServerError'
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: 'slm_<8 char prefix>_<40 char secret>'
+      description: SLM Studio API key (organization or project scope). Only sha256(full key) is stored server side.
+  headers:
+    XRequestID:
+      description: Request id generated by the gateway (or propagated), also written to logs and traces. Quote it in support requests.
+      schema:
+        type: string
+    XSLMRoute:
+      description: Route label that served the request (`stable`, `canary`, `variant-b`, ...), from `endpoint_routes.label`.
+      schema:
+        type: string
+    RateLimitLimitRequests:
+      description: Requests per minute allowed for this key/org.
+      schema:
+        type: integer
+    RateLimitRemainingRequests:
+      description: Requests remaining in the current window.
+      schema:
+        type: integer
+    RateLimitLimitTokens:
+      description: Tokens per minute allowed for the org.
+      schema:
+        type: integer
+    RateLimitRemainingTokens:
+      description: Tokens remaining in the current window.
+      schema:
+        type: integer
+    RateLimitResetRequests:
+      description: Time until the request window frees capacity, for example `60s`.
+      schema:
+        type: string
+    RateLimitResetTokens:
+      description: Time until the token window frees capacity, for example `12s`.
+      schema:
+        type: string
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+  responses:
+    InvalidRequest:
+      description: Body is not valid JSON (`invalid_json`) or not a valid request object (`invalid_request_body`, with `param` naming the field). Errors returned by the model server itself (for example a prompt longer than `max_model_len`) are passed through with the upstream body.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: "messages: Field required"
+              type: invalid_request_error
+              param: messages
+              code: invalid_request_body
+    Unauthorized:
+      description: |
+        Missing, malformed, unknown, revoked or expired API key. `code` is one of `missing_api_key`, `invalid_api_key`,
+        `api_key_revoked`, `api_key_expired` (also used when a rotated key's grace period has ended).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: Incorrect API key provided.
+              type: authentication_error
+              param: null
+              code: invalid_api_key
+    ModelNotFound:
+      description: No enabled endpoint alias matches `model`.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: The model 'foo' does not exist or you do not have access to it.
+              type: invalid_request_error
+              code: model_not_found
+    PayloadTooLarge:
+      description: Request body exceeds the gateway limit (4 MiB by default, `max_request_bytes`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: Request body exceeds 4194304 bytes
+              type: invalid_request_error
+              param: null
+              code: request_too_large
+    RateLimited:
+      description: |
+        Rate limit (RPM/TPM) or quota exceeded. `code` distinguishes `rate_limit_exceeded` (retry after the window)
+        from `insufficient_quota` (monthly token or budget limit; retrying will not help).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-RateLimit-Limit-Requests:
+          $ref: '#/components/headers/RateLimitLimitRequests'
+        X-RateLimit-Remaining-Requests:
+          $ref: '#/components/headers/RateLimitRemainingRequests'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            rpm:
+              value:
+                error:
+                  message: 'Rate limit reached for requests: limit 600 per minute. Retry in 7s.'
+                  type: rate_limit_error
+                  param: null
+                  code: rate_limit_exceeded
+            quota:
+              value:
+                error:
+                  message: You exceeded your monthly token quota. Raise the quota or wait for the next period.
+                  type: rate_limit_error
+                  param: null
+                  code: insufficient_quota
+    ServerError:
+      description: Unexpected gateway error.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: Internal server error.
+              type: server_error
+              code: internal_error
+    UpstreamError:
+      description: The model server connection failed (`upstream_error`) or no model server could be reached after retries (`upstream_unavailable`).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: The model server connection failed.
+              type: server_error
+              param: null
+              code: upstream_error
+    ModelUnavailable:
+      description: 'The alias exists but no deployment is running behind it (stopped, provisioning or failed): code `no_healthy_deployment`.'
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: No running deployment is currently available for 'phi-4-mini'.
+              type: server_error
+              param: null
+              code: no_healthy_deployment
+    UpstreamTimeout:
+      description: The model server did not respond within the gateway read timeout (300 s by default).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: The model server timed out.
+              type: server_error
+              param: null
+              code: upstream_timeout
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+    ErrorBody:
+      type: object
+      required: [message, type, code]
+      properties:
+        message:
+          type: string
+        type:
+          type: string
+          description: Error class.
+          enum:
+            - invalid_request_error
+            - authentication_error
+            - permission_error
+            - rate_limit_error
+            - server_error
+        code:
+          type: string
+          description: 'Stable machine-readable code: `invalid_json`, `invalid_request_body`, `missing_api_key`, `invalid_api_key`, `api_key_revoked`, `api_key_expired`, `model_not_found`, `request_too_large`, `rate_limit_exceeded`, `insufficient_quota`, `upstream_error`, `upstream_unavailable`, `no_healthy_deployment`, `upstream_timeout`, `internal_error`. Upstream (vLLM) errors keep their own codes.'
+        param:
+          type: [string, 'null']
+          description: Offending request parameter, or null.
+    SSEStream:
+      type: string
+      description: |
+        Server-sent events. Each event line is `data: <JSON>` followed by a blank line; the last event is
+        `data: [DONE]`. For chat the JSON is a `ChatCompletionChunk`, for completions a `CompletionResponse`
+        with `object: text_completion`. A mid-stream failure is delivered as one event
+        `data: {"error": {...ErrorBody...}}` followed by stream close (HTTP status is already 200 by then).
+      x-sse-event-schema:
+        $ref: '#/components/schemas/ChatCompletionChunk'
+    StreamOptions:
+      type: object
+      properties:
+        include_usage:
+          type: boolean
+          default: false
+          description: When true, a final chunk with empty `choices` and a `usage` object is sent before `[DONE]`.
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+        prompt_tokens_details:
+          type: [object, 'null']
+          properties:
+            cached_tokens:
+              type: integer
+              description: Prompt tokens served from the prefix cache, when the backend reports it (recorded in `usage_logs.cached_tokens`).
+    ToolCall:
+      type: object
+      required: [id, type, function]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required: [name, arguments]
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: JSON-encoded arguments.
+    ContentPart:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [text, image_url]
+        text:
+          type: string
+        image_url:
+          type: object
+          properties:
+            url:
+              type: string
+    ChatMessage:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [system, developer, user, assistant, tool]
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/ContentPart'
+            - type: 'null'
+        name:
+          type: string
+        tool_call_id:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+    Tool:
+      type: object
+      required: [type, function]
+      properties:
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required: [name]
+          properties:
+            name:
+              type: string
+            description:
+              type: string
+            parameters:
+              type: object
+              additionalProperties: true
+              description: JSON Schema for the arguments.
+    ResponseFormat:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [text, json_object, json_schema]
+        json_schema:
+          type: object
+          additionalProperties: true
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: Endpoint alias.
+          examples: [phi-4-mini]
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          default: 1
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 1
+        n:
+          type: integer
+          minimum: 1
+          default: 1
+        stream:
+          type: boolean
+          default: false
+        stream_options:
+          oneOf:
+            - $ref: '#/components/schemas/StreamOptions'
+            - type: 'null'
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+              maxItems: 4
+            - type: 'null'
+        max_tokens:
+          type: [integer, 'null']
+          minimum: 1
+          description: Maximum completion tokens (also accepted as `max_completion_tokens`). Counts toward TPM pre-check.
+        max_completion_tokens:
+          type: [integer, 'null']
+          minimum: 1
+        presence_penalty:
+          type: number
+          minimum: -2
+          maximum: 2
+        frequency_penalty:
+          type: number
+          minimum: -2
+          maximum: 2
+        seed:
+          type: [integer, 'null']
+        logprobs:
+          type: [boolean, 'null']
+        top_logprobs:
+          type: [integer, 'null']
+          minimum: 0
+          maximum: 20
+        response_format:
+          $ref: '#/components/schemas/ResponseFormat'
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+        tool_choice:
+          description: '`none`, `auto`, `required`, or a function selector.'
+          oneOf:
+            - type: string
+              enum: [none, auto, required]
+            - type: object
+              additionalProperties: true
+        user:
+          type: string
+          description: End-user identifier for the caller's own tracking. Not used for authorization.
+      additionalProperties: true
+    ChatChoice:
+      type: object
+      required: [index, message, finish_reason]
+      properties:
+        index:
+          type: integer
+        message:
+          $ref: '#/components/schemas/ChatMessage'
+        finish_reason:
+          type: [string, 'null']
+          enum: [stop, length, tool_calls, content_filter, null]
+        logprobs:
+          type: [object, 'null']
+          additionalProperties: true
+    ChatCompletionResponse:
+      type: object
+      required: [id, object, created, model, choices, usage]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [chat.completion]
+        created:
+          type: integer
+          description: Unix seconds.
+        model:
+          type: string
+          description: Echo of the requested alias.
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatChoice'
+        usage:
+          $ref: '#/components/schemas/Usage'
+        system_fingerprint:
+          type: [string, 'null']
+    ChatDelta:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [assistant]
+        content:
+          type: [string, 'null']
+        tool_calls:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    ChatChunkChoice:
+      type: object
+      required: [index, delta]
+      properties:
+        index:
+          type: integer
+        delta:
+          $ref: '#/components/schemas/ChatDelta'
+        finish_reason:
+          type: [string, 'null']
+          enum: [stop, length, tool_calls, content_filter, null]
+    ChatCompletionChunk:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [chat.completion.chunk]
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          description: Empty only on the final usage chunk.
+          items:
+            $ref: '#/components/schemas/ChatChunkChoice'
+        usage:
+          oneOf:
+            - $ref: '#/components/schemas/Usage'
+            - type: 'null'
+    CompletionRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model:
+          type: string
+        prompt:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        max_tokens:
+          type: integer
+          minimum: 1
+          default: 16
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+        n:
+          type: integer
+          minimum: 1
+          default: 1
+        stream:
+          type: boolean
+          default: false
+        stream_options:
+          oneOf:
+            - $ref: '#/components/schemas/StreamOptions'
+            - type: 'null'
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+            - type: 'null'
+        echo:
+          type: boolean
+        seed:
+          type: [integer, 'null']
+        logprobs:
+          type: [integer, 'null']
+        suffix:
+          type: [string, 'null']
+        user:
+          type: string
+      additionalProperties: true
+    CompletionChoice:
+      type: object
+      required: [index, text, finish_reason]
+      properties:
+        index:
+          type: integer
+        text:
+          type: string
+        finish_reason:
+          type: [string, 'null']
+        logprobs:
+          type: [object, 'null']
+          additionalProperties: true
+    CompletionResponse:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [text_completion]
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/CompletionChoice'
+        usage:
+          $ref: '#/components/schemas/Usage'
+    EmbeddingRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model:
+          type: string
+        input:
+          description: Text or batch of texts (token-array inputs are not guaranteed).
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+              minItems: 1
+        encoding_format:
+          type: string
+          enum: [float, base64]
+          default: float
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Truncate to this dimension for models trained with Matryoshka representation; ignored otherwise.
+        user:
+          type: string
+    Embedding:
+      type: object
+      required: [object, index, embedding]
+      properties:
+        object:
+          type: string
+          enum: [embedding]
+        index:
+          type: integer
+        embedding:
+          oneOf:
+            - type: array
+              items:
+                type: number
+            - type: string
+              description: base64 when `encoding_format` is `base64`.
+    EmbeddingResponse:
+      type: object
+      required: [object, data, model, usage]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Embedding'
+        model:
+          type: string
+        usage:
+          type: object
+          required: [prompt_tokens, total_tokens]
+          properties:
+            prompt_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+    Model:
+      type: object
+      required: [id, object, created, owned_by]
+      properties:
+        id:
+          type: string
+          description: Endpoint alias.
+        object:
+          type: string
+          enum: [model]
+        created:
+          type: integer
+        owned_by:
+          type: string
+          description: Organization slug, or `slm-studio` for shared-catalogue aliases.
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'

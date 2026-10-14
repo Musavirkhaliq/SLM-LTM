@@ -1,0 +1,138 @@
+name: Build and Push
+
+# Builds every image, pushes to GHCR, scans with Trivy, then attaches an SBOM attestation and a keyless cosign
+# signature. Only images that pass the scan are signed; deploy.yml refuses to deploy unsigned images.
+#
+# Repository variables used by the web image (NEXT_PUBLIC_* is inlined at build time, hence one image per API origin):
+#   WEB_API_BASE_URL_PRODUCTION  e.g. https://api.slm.example.com        (image: web)
+#   WEB_API_BASE_URL_STAGING     e.g. https://api.staging.slm.example.com (image: web-staging)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  image:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+      packages: write      # push to GHCR
+      id-token: write      # keyless cosign signing (OIDC)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: gateway,    file: Dockerfile.service, args: "SERVICE=gateway\nPORT=8000",       platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: auth,       file: Dockerfile.service, args: "SERVICE=auth\nPORT=8001",          platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: registry,   file: Dockerfile.service, args: "SERVICE=registry\nPORT=8002",      platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: finetune,   file: Dockerfile.service, args: "SERVICE=finetune\nPORT=8003",      platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: rag,        file: Dockerfile.service, args: "SERVICE=rag\nPORT=8004",           platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: evaluation, file: Dockerfile.service, args: "SERVICE=evaluation\nPORT=8005",    platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: deployment, file: Dockerfile.service, args: "SERVICE=deployment\nPORT=8006",    platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: monitoring, file: Dockerfile.service, args: "SERVICE=monitoring\nPORT=8007",    platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: cost,       file: Dockerfile.service, args: "SERVICE=cost\nPORT=8008",          platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: web,         file: Dockerfile.web, args: "NEXT_PUBLIC_API_BASE=${{ vars.WEB_API_BASE_URL_PRODUCTION }}\nNEXT_PUBLIC_USE_MOCKS=false", platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          - { name: web-staging, file: Dockerfile.web, args: "NEXT_PUBLIC_API_BASE=${{ vars.WEB_API_BASE_URL_STAGING }}\nNEXT_PUBLIC_USE_MOCKS=false",    platforms: "linux/amd64,linux/arm64", timeout: 45 }
+          # arm64 (DGX Spark) under QEMU emulation is slow for the CUDA/PyTorch stack; move it to a native
+          # arm64 runner (ubuntu-24.04-arm) if the build exceeds the timeout.
+          - { name: trainer,    file: Dockerfile.trainer, args: "", platforms: "linux/amd64,linux/arm64", timeout: 150 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}/${{ matrix.name }}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=slm-studio-${{ matrix.name }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/${{ matrix.file }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ${{ matrix.args }}
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          provenance: mode=max
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Trivy image scan (blocks on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "1"
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.name }}.spdx.json
+          upload-artifact: true
+          artifact-name: sbom-${{ matrix.name }}.spdx.json
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image and attest SBOM (keyless, OIDC identity of this workflow)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign attest --yes --type spdxjson --predicate "sbom-${{ matrix.name }}.spdx.json" "${IMAGE}@${DIGEST}"
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo ""
+            echo "- image: \`${IMAGE}@${DIGEST}\`"
+            echo "- tags: \`$(echo '${{ steps.meta.outputs.tags }}' | tr '\n' ' ')\`"
+            echo "- verify: \`cosign verify ${IMAGE}@${DIGEST} --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/' --certificate-oidc-issuer https://token.actions.githubusercontent.com\`"
+          } >> "$GITHUB_STEP_SUMMARY"

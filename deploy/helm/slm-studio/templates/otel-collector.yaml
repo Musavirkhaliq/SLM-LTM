@@ -1,0 +1,102 @@
+{{- /* OpenTelemetry Collector: receives OTLP from every service, re-exports metrics for Prometheus. */ -}}
+{{- if .Values.otel.enabled }}
+{{- $name := printf "%s-otel-collector" (include "slm.fullname" .) }}
+{{- $sel := dict "app.kubernetes.io/name" (include "slm.name" .) "app.kubernetes.io/instance" .Release.Name "app.kubernetes.io/component" "otel-collector" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "otel-collector" "tier" "observability") | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml .Values.otel.config | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "otel-collector" "tier" "observability") | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "otel-collector" "tier" "observability") | nindent 4 }}
+spec:
+  replicas: {{ .Values.otel.replicas | int }}
+  selector:
+    matchLabels:
+      {{- toYaml $sel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slm.componentLabels" (dict "root" . "component" "otel-collector" "tier" "observability") | nindent 8 }}
+        slm-studio.io/egress: external
+      annotations:
+        checksum/config: {{ toYaml .Values.otel.config | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      {{- include "slm.pullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: otel-collector
+          image: {{ printf "%s:%s" .Values.otel.image.repository .Values.otel.image.tag | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args: ["--config=/conf/config.yaml"]
+          ports:
+            - { name: otlp-grpc, containerPort: 4317 }
+            - { name: otlp-http, containerPort: 4318 }
+            - { name: prom-app, containerPort: 8889 }
+            - { name: prom-self, containerPort: 8888 }
+            - { name: health, containerPort: 13133 }
+          readinessProbe:
+            httpGet: { path: /, port: health }
+          livenessProbe:
+            httpGet: { path: /, port: health }
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.otel.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /conf, readOnly: true }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+      {{- include "slm.scheduling" (dict "root" . "selector" $sel) | nindent 6 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "otel-collector" "tier" "observability") | nindent 4 }}
+spec:
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: otlp-grpc }
+    - { name: otlp-http, port: 4318, targetPort: otlp-http }
+    - { name: prom-app, port: 8889, targetPort: prom-app }
+    - { name: prom-self, port: 8888, targetPort: prom-self }
+  selector:
+    {{- toYaml $sel | nindent 4 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "otel-collector" "tier" "observability") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- toYaml $sel | nindent 6 }}
+{{- end }}

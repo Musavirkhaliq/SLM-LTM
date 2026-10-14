@@ -1,0 +1,25 @@
+# Build context is the repository root for every image (docker build -f deploy/docker/Dockerfile.<x> .)
+**/.git
+**/.github
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/node_modules
+**/.next
+**/coverage
+**/.env
+**/.env.*
+!**/.env.example
+**/*.log
+docs
+deploy/helm
+deploy/k8s
+deploy/grafana
+deploy/compose
+**/tests
+**/test
+**/*.md
+!**/README.md

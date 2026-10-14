@@ -1,0 +1,19 @@
+# Reference manifests for readers who do not use Helm. Rendered-style, hand-maintained: the Helm chart
+# (deploy/helm/slm-studio) is the source of truth for production. Apply in file order:
+#   kubectl apply -f deploy/k8s/00-namespace.yaml -f deploy/k8s/05-networkpolicy.yaml \
+#                 -f deploy/k8s/10-vllm-deployment.yaml -f deploy/k8s/20-vllm-canary.yaml
+#
+# Pod Security Admission "restricted": non-root, no privilege escalation, drop ALL, seccomp RuntimeDefault.
+# GPU access via the device plugin (nvidia.com/gpu limit) needs no extra privileges, so vLLM fits `restricted`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slm-studio
+  labels:
+    app.kubernetes.io/part-of: slm-studio
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

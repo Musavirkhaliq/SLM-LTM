@@ -1,0 +1,26 @@
+# Production overlay: layered on values.yaml (+ values-ha.yaml via HELM_VALUES_PROFILE=ha).
+# Adjust hosts and secret-store paths. Secret VALUES never live here.
+config:
+  SLM_ENV: prod
+  SLM_LOG_LEVEL: INFO
+
+ingress:
+  clusterIssuer: letsencrypt-prod
+  api: { host: api.slm.example.com }
+  app: { host: app.slm.example.com }
+
+secrets:
+  externalSecret:
+    data:
+      SLM_DATABASE_URL:    { key: slm-studio/production/postgres }
+      SLM_REDIS_URL:       { key: slm-studio/production/redis }
+      SLM_JWT_PRIVATE_KEY: { key: slm-studio/production/jwt }
+      SLM_JWT_PUBLIC_KEY:  { key: slm-studio/production/jwt }
+      SLM_S3_ACCESS_KEY:   { key: slm-studio/production/s3 }
+      SLM_S3_SECRET_KEY:   { key: slm-studio/production/s3 }
+      SLM_TRAINER_TOKEN:   { key: slm-studio/production/trainer }
+migration:
+  externalSecret:
+    data:
+      SLM_MIGRATE_DATABASE_URL: { key: slm-studio/production/postgres, property: migrator_url }
+      SLM_APP_PASSWORD:         { key: slm-studio/production/postgres, property: app_password }

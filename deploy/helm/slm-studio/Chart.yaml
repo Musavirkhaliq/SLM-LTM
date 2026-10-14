@@ -1,0 +1,18 @@
+apiVersion: v2
+name: slm-studio
+description: >-
+  SLM Studio: multi-tenant small-language-model-as-a-service control plane (gateway, auth, registry,
+  fine-tuning, RAG, evaluation, deployment, monitoring, cost), web UI, vLLM model servers,
+  trainer RBAC, observability and network policy.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+keywords: [llm, slm, vllm, inference, mlops, multi-tenant]
+home: https://github.com/your-org/slm-studio
+sources:
+  - https://github.com/your-org/slm-studio
+annotations:
+  # Optional cluster add-ons this chart can integrate with (all toggled from values):
+  #   ingress-nginx, cert-manager, external-secrets, prometheus-operator, keda, nvidia gpu-operator/dcgm-exporter
+  slm-studio.io/optional-dependencies: "ingress-nginx,cert-manager,external-secrets,prometheus-operator,keda,gpu-operator"

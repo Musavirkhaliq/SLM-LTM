@@ -1,0 +1,98 @@
+{{- /*
+  1. Trainer: the `finetune` service creates batch/v1 Jobs (image slm-studio/trainer, nvidia.com/gpu) and watches them.
+     The Job pods run as a separate, token-less ServiceAccount.
+  2. Deployment controller: the `deployment` service creates/scales vLLM StatefulSets, Services and PVCs.
+  Both are namespaced Roles (no ClusterRole): blast radius is limited to the release namespace.
+*/ -}}
+{{- $ns := default .Release.Namespace .Values.trainer.namespace }}
+{{- if .Values.services.finetune.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "slm.fullname" . }}-trainer
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "trainer" "tier" "trainer") | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "slm.fullname" . }}-trainer-launcher
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "trainer" "tier" "trainer") | nindent 4 }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete", "patch"]     # patch: suspend/cancel
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "slm.fullname" . }}-trainer-launcher
+  namespace: {{ $ns }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "trainer" "tier" "trainer") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "slm.fullname" . }}-trainer-launcher
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "slm.fullname" . }}-finetune
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if and .Values.deploymentController.rbac.enabled .Values.services.deployment.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "slm.fullname" . }}-deployment-controller
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "deployment" "tier" "control-plane") | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale", "deployments/scale"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims", "serviceaccounts"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "slm.fullname" . }}-deployment-controller
+  labels:
+    {{- include "slm.componentLabels" (dict "root" . "component" "deployment" "tier" "control-plane") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "slm.fullname" . }}-deployment-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "slm.fullname" . }}-deployment
+    namespace: {{ .Release.Namespace }}
+{{- end }}

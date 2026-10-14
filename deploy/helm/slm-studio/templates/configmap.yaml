@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slm.fullname" . }}-config
+  labels:
+    {{- include "slm.labels" . | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.config }}
+  {{- if not (and (eq $k "SLM_OTLP_ENDPOINT") $.Values.otel.enabled) }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if .Values.otel.enabled }}
+  SLM_OTLP_ENDPOINT: {{ printf "http://%s-otel-collector:4318" (include "slm.fullname" .) | quote }}
+  {{- end }}
+  {{- if .Values.ingress.enabled }}
+  SLM_PUBLIC_BASE_URL: {{ printf "https://%s" .Values.ingress.api.host | quote }}
+  {{- end }}
+  # Upstream base URLs used by the gateway to reverse-proxy /api/v1/* (GatewaySettings.<service>_url).
+  {{- range $name, $cfg := .Values.services }}
+  {{- if and $cfg.enabled (not (has $name (list "web" "rag-worker"))) }}
+  SLM_{{ $name | upper }}_URL: {{ printf "http://%s-%s:%d" (include "slm.fullname" $) $name ($cfg.port | int) | quote }}
+  {{- end }}
+  {{- end }}
+  # Settings the finetune service uses to create trainer Jobs.
+  SLM_TRAINER_NAMESPACE: {{ default .Release.Namespace .Values.trainer.namespace | quote }}
+  SLM_TRAINER_IMAGE: {{ include "slm.image" (dict "root" . "image" .Values.trainer.image "name" "trainer") | quote }}
+  SLM_TRAINER_SERVICE_ACCOUNT: {{ printf "%s-trainer" (include "slm.fullname" .) | quote }}
+  SLM_TRAINER_SECRET_NAME: {{ include "slm.secretName" . | quote }}
+  SLM_TRAINER_NODE_SELECTOR: {{ toJson (default (dict) .Values.trainer.nodeSelector) | quote }}
+  SLM_TRAINER_TOLERATIONS: {{ toJson (default (list) .Values.trainer.tolerations) | quote }}
+  SLM_TRAINER_TTL_SECONDS: {{ .Values.trainer.ttlSecondsAfterFinished | int | quote }}
+  SLM_TRAINER_BACKOFF_LIMIT: {{ .Values.trainer.backoffLimit | int | quote }}
+  SLM_TRAINER_ACTIVE_DEADLINE_SECONDS: {{ .Values.trainer.activeDeadlineSeconds | int | quote }}
+  # Settings the deployment service uses to create vLLM servers at runtime.
+  SLM_VLLM_NAMESPACE: {{ .Release.Namespace | quote }}
+  SLM_VLLM_IMAGE: {{ printf "%s:%s" .Values.vllm.image.repository .Values.vllm.image.tag | quote }}
+  SLM_VLLM_NODE_SELECTOR: {{ toJson (default (dict) .Values.vllm.nodeSelector) | quote }}
+  SLM_VLLM_TOLERATIONS: {{ toJson (default (list) .Values.vllm.tolerations) | quote }}
+  SLM_VLLM_CACHE_STORAGE_CLASS: {{ .Values.vllm.cache.storageClassName | quote }}

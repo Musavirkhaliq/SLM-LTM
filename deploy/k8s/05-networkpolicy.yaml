@@ -1,0 +1,63 @@
+# Minimal zero-trust baseline for the sample vLLM pods in this directory:
+# default-deny, then allow DNS, gateway -> vLLM (8000), Prometheus scrape, and HTTPS egress for model download.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: slm-studio
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: slm-studio
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vllm-ingress-from-gateway-and-prometheus
+  namespace: slm-studio
+spec:
+  podSelector:
+    matchLabels:
+      slm-studio.io/tier: inference
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gateway
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - { protocol: TCP, port: 8000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vllm-egress-model-download
+  namespace: slm-studio
+spec:
+  podSelector:
+    matchLabels:
+      slm-studio.io/tier: inference
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - { protocol: TCP, port: 443 }     # Hugging Face / S3
+        - { protocol: TCP, port: 9000 }    # MinIO

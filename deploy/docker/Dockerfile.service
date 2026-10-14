@@ -1,0 +1,93 @@
+# syntax=docker/dockerfile:1.9
+#
+# One parameterised image definition for every Python control-plane service
+# (gateway, auth, registry, finetune, rag, evaluation, deployment, monitoring, cost).
+#
+#   docker build -f deploy/docker/Dockerfile.service \
+#     --build-arg SERVICE=gateway --build-arg PORT=8000 -t slm-studio/gateway:dev .
+#
+# Build context = repository root (uv workspace root with pyproject.toml + uv.lock).
+# Assumes: workspace package name `slm-<SERVICE>`, import package `slm_<SERVICE>`,
+# ASGI app at `slm_<SERVICE>.main:app`, uvicorn declared as a dependency of the service.
+#
+# Base images are pinned to exact versions. For fully immutable builds also pin the
+# digest (FROM python:3.12.8-slim-bookworm@sha256:...); Dependabot's docker ecosystem
+# (see .github/dependabot.yml) keeps tag+digest current.
+ARG PYTHON_VERSION=3.12.8
+ARG UV_VERSION=0.11.11
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+# ---- stage 1: reduce the workspace to its manifests so the dependency layer is only
+# ---- invalidated when a pyproject.toml / uv.lock changes, not on every source edit.
+FROM python:${PYTHON_VERSION}-slim-bookworm AS manifests
+WORKDIR /m
+COPY pyproject.toml uv.lock ./
+COPY services/ services/
+RUN find services -type f ! -name pyproject.toml -delete \
+ && find services -type d -empty -delete
+
+# ---- stage 2: build the virtualenv
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+ARG SERVICE=gateway
+ARG PACKAGE=slm-${SERVICE}
+COPY --from=uv /uv /uvx /bin/
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+WORKDIR /src
+
+COPY --from=manifests /m/ ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-workspace --package "${PACKAGE}"
+
+COPY services/ services/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable --package "${PACKAGE}"
+# Fail the build (not the pod) if the service or uvicorn is not importable.
+RUN /app/.venv/bin/python -c "import importlib, uvicorn; importlib.import_module('slm_${SERVICE}')"
+
+# ---- stage 3: runtime (no uv, no compilers, non-root, no shell login)
+FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+ARG SERVICE=gateway
+ARG PORT=8000
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG SOURCE=https://github.com/your-org/slm-studio
+
+LABEL org.opencontainers.image.title="slm-studio-${SERVICE}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.licenses="Proprietary"
+
+RUN groupadd --system --gid 10001 slm \
+ && useradd  --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent \
+             --shell /usr/sbin/nologin slm
+
+WORKDIR /app
+COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
+# SQL migrations + runner travel with every image so the Helm migration Job can reuse any of them.
+COPY --chown=10001:10001 db/ /app/db/
+COPY --chown=10001:10001 deploy/docker/healthcheck.py /app/healthcheck.py
+
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONHASHSEED=random \
+    SLM_SERVICE=${SERVICE} \
+    SLM_SERVICE_MODULE=slm_${SERVICE} \
+    PORT=${PORT} \
+    HOME=/tmp
+
+USER 10001:10001
+EXPOSE ${PORT}
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD ["python", "/app/healthcheck.py"]
+
+# Exec form via sh so ${PORT}/module are expanded; `exec` keeps uvicorn as PID 1 for clean SIGTERM handling.
+# One worker per container: scale with replicas (WEB_CONCURRENCY is honoured by uvicorn if set).
+# rag-worker: reuse the `rag` image and override the command, e.g. ["python","-m","slm_rag.worker"].
+CMD ["sh", "-c", "exec uvicorn ${SLM_SERVICE_MODULE}.main:app --host 0.0.0.0 --port ${PORT} --proxy-headers --no-server-header --timeout-graceful-shutdown 30"]

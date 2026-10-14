@@ -1,0 +1,60 @@
+# Prometheus config for docker compose. In Kubernetes the chart's ServiceMonitors replace this file.
+# Label contract shared with dashboards/alerts:  slm_service = control-plane service name,
+#                                                slm_deployment = vLLM deployment name.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: dev
+
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+scrape_configs:
+  - job_name: slm-services
+    metrics_path: /metrics
+    static_configs:
+      - { targets: ["gateway:8000"],    labels: { slm_service: gateway } }
+      - { targets: ["auth:8001"],       labels: { slm_service: auth } }
+      - { targets: ["registry:8002"],   labels: { slm_service: registry } }
+      - { targets: ["finetune:8003"],   labels: { slm_service: finetune } }
+      - { targets: ["rag:8004"],        labels: { slm_service: rag } }
+      - { targets: ["evaluation:8005"], labels: { slm_service: evaluation } }
+      - { targets: ["deployment:8006"], labels: { slm_service: deployment } }
+      - { targets: ["monitoring:8007"], labels: { slm_service: monitoring } }
+      - { targets: ["cost:8008"],       labels: { slm_service: cost } }
+
+  # vLLM (profile `vllm` real server, profile `stub` mock) expose /metrics on the API port.
+  - job_name: vllm
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["vllm:8000"]
+        labels: { slm_deployment: local-vllm }
+      - targets: ["vllm-stub:8000"]
+        labels: { slm_deployment: local-stub }
+
+  # GPU metrics (profile `gpu`: dcgm-exporter). Target stays DOWN when the profile is not started.
+  - job_name: dcgm
+    static_configs:
+      - targets: ["dcgm-exporter:9400"]
+
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]   # application metrics re-exported from OTLP
+        labels: { source: otlp }
+      - targets: ["otel-collector:8888"]   # collector self-metrics
+        labels: { source: collector }
+
+  - job_name: qdrant
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["qdrant:6333"]
+
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ["minio:9000"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

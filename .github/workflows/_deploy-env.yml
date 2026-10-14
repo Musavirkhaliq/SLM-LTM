@@ -1,0 +1,160 @@
+name: Deploy environment (reusable)
+
+# Called by deploy.yml once per environment. Environment protection rules (required reviewers) are configured on the
+# GitHub Environment named by `environment`; this workflow only declares it, so `production` waits for approval.
+#
+# Per-environment configuration (Settings > Environments > <name>):
+#   secrets:   KUBE_CONFIG (base64 kubeconfig of a deploy-scoped ServiceAccount), SMOKE_API_KEY (viewer-level slm_ key)
+#   variables: API_URL (https://api.<domain>), KUBE_NAMESPACE (default slm-studio), HELM_RELEASE (default slm-studio),
+#              HELM_VALUES_PROFILE (optional: ha | dgx-spark), SMOKE_MODEL (optional endpoint alias for a chat probe),
+#              IMAGE_PULL_SECRET (optional: name of the registry pull Secret in the namespace)
+# For clusters with OIDC federation, replace the KUBE_CONFIG step with your cloud's login action (id-token: write).
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      image_tag:
+        type: string
+        required: true
+      ref:
+        description: Git ref (commit SHA) whose chart and scripts are deployed
+        type: string
+        required: true
+      web_image_name:
+        type: string
+        default: web
+      values_files:
+        description: Extra Helm values files layered after values.yaml (space separated, repo-relative)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  verify-images:
+    name: Verify image signatures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    env:
+      TAG: ${{ inputs.image_tag }}
+      WEB_IMAGE: ${{ inputs.web_image_name }}
+    steps:
+      - uses: sigstore/cosign-installer@v3
+      - name: Verify keyless signatures produced by build-push.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "$GH_TOKEN" | cosign login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          for name in gateway auth registry finetune rag evaluation deployment monitoring cost "$WEB_IMAGE" trainer; do
+            echo "== ghcr.io/${repo}/${name}:${TAG}"
+            cosign verify "ghcr.io/${repo}/${name}:${TAG}" \
+              --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/build-push\.yml@refs/(heads/main|tags/v.+)$" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          done
+
+  deploy:
+    name: Helm upgrade (${{ inputs.environment }})
+    needs: verify-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.API_URL }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ inputs.image_tag }}
+      RELEASE: ${{ vars.HELM_RELEASE || 'slm-studio' }}
+      NAMESPACE: ${{ vars.KUBE_NAMESPACE || 'slm-studio' }}
+      CHART: deploy/helm/slm-studio
+      WEB_IMAGE: ${{ inputs.web_image_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - uses: azure/setup-kubectl@v4
+      - name: Configure cluster access
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          set -euo pipefail
+          umask 077
+          echo "$KUBE_CONFIG" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+      - name: Remember the currently deployed revision (rollback target)
+        id: prev
+        run: |
+          set -euo pipefail
+          prev="$(helm history "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | jq -r '[.[] | select(.status == "deployed")] | last | .revision // empty' || true)"
+          echo "revision=${prev}" >> "$GITHUB_OUTPUT"
+          echo "previous deployed revision: ${prev:-<none: first install>}"
+      - name: Helm upgrade --install (atomic)
+        id: upgrade
+        env:
+          VALUES_PROFILE: ${{ vars.HELM_VALUES_PROFILE }}
+          EXTRA_VALUES: ${{ inputs.values_files }}
+          PULL_SECRET: ${{ vars.IMAGE_PULL_SECRET }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { echo "invalid image tag: $TAG" >&2; exit 1; }
+          args=(-f "$CHART/values.yaml")
+          if [[ -n "${VALUES_PROFILE:-}" ]]; then
+            [[ "$VALUES_PROFILE" =~ ^[a-z0-9-]+$ ]] || { echo "invalid HELM_VALUES_PROFILE" >&2; exit 1; }
+            args+=(-f "$CHART/values-${VALUES_PROFILE}.yaml")
+          fi
+          for f in $EXTRA_VALUES; do args+=(-f "$f"); done
+          if [[ -n "${PULL_SECRET:-}" ]]; then args+=(--set "global.imagePullSecrets[0].name=${PULL_SECRET}"); fi
+          # NOTE: pre-upgrade migrations run as a hook and are NOT reversed by a rollback. Keep migrations backward
+          # compatible with the previous release (expand/contract).
+          helm upgrade --install "$RELEASE" "$CHART" \
+            --namespace "$NAMESPACE" \
+            "${args[@]}" \
+            --set "global.imageRegistry=ghcr.io" \
+            --set "global.imageRepositoryPrefix=${GITHUB_REPOSITORY,,}" \
+            --set "global.imageTag=${TAG}" \
+            --set "services.web.image.name=${WEB_IMAGE}" \
+            --atomic --wait --wait-for-jobs --timeout 25m --history-max 10
+      - name: Post-deploy smoke test (/readyz, /v1/models)
+        id: smoke
+        env:
+          API_URL: ${{ vars.API_URL }}
+          SMOKE_API_KEY: ${{ secrets.SMOKE_API_KEY }}
+          SMOKE_MODEL: ${{ vars.SMOKE_MODEL }}
+          SMOKE_REQUIRE_MODELS: "1"
+        run: bash deploy/scripts/smoke-test.sh "$API_URL"
+      - name: Roll back to the previous revision (smoke test failed)
+        if: failure() && steps.upgrade.outcome == 'success' && steps.smoke.outcome == 'failure'
+        env:
+          PREV: ${{ steps.prev.outputs.revision }}
+          API_URL: ${{ vars.API_URL }}
+          SMOKE_API_KEY: ${{ secrets.SMOKE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PREV" ]]; then
+            echo "::error::smoke test failed on a first install: nothing to roll back to"; exit 1
+          fi
+          echo "::warning::smoke test failed; rolling back $RELEASE to revision $PREV"
+          helm rollback "$RELEASE" "$PREV" -n "$NAMESPACE" --wait --wait-for-jobs --timeout 20m --cleanup-on-fail
+          SMOKE_ATTEMPTS=12 bash deploy/scripts/smoke-test.sh "$API_URL" || echo "::error::service still unhealthy after rollback"
+          echo "### Rolled back $RELEASE to revision $PREV (tag $TAG failed its smoke test)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.environment }}: ${RELEASE} -> \`${TAG}\`"
+            echo "- upgrade: ${{ steps.upgrade.outcome }}"
+            echo "- smoke test: ${{ steps.smoke.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"

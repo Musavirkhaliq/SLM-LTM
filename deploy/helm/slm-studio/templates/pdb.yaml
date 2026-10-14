@@ -1,0 +1,50 @@
+{{- /*
+  PodDisruptionBudgets: one per control-plane service and per vLLM model.
+  A per-service `pdb` REPLACES the default (it is not merged), so `minAvailable` and `maxUnavailable` never coexist.
+*/ -}}
+{{- range $name, $cfg := .Values.services }}
+{{- if $cfg.enabled }}
+{{- $pdb := default $.Values.serviceDefaults.pdb $cfg.pdb }}
+{{- $tier := default "control-plane" $cfg.tier }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "slm.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" $name "tier" $tier) | nindent 4 }}
+spec:
+  {{- if hasKey $pdb "minAvailable" }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ $pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "slm.selectorLabels" (dict "root" $ "component" $name) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- if .Values.vllm.enabled }}
+{{- range $name, $cfg := .Values.vllm.models }}
+{{- $m := include "slm.vllm.model" (dict "root" $ "name" $name "cfg" $cfg) | fromJson }}
+{{- if $m.enabled }}
+{{- $pdb := default (dict "maxUnavailable" 1) $m.pdb }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "slm.fullname" $ }}-vllm-{{ $name }}
+  labels:
+    {{- include "slm.componentLabels" (dict "root" $ "component" (printf "vllm-%s" $name) "tier" "inference") | nindent 4 }}
+spec:
+  {{- if hasKey $pdb "minAvailable" }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ $pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "slm.selectorLabels" (dict "root" $ "component" (printf "vllm-%s" $name)) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}

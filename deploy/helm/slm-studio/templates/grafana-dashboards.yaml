@@ -1,0 +1,18 @@
+{{- /* Dashboards are discovered by the Grafana sidecar (label below). Source of truth: deploy/grafana/dashboards;
+       the copies in ./dashboards are verified identical in CI. */ -}}
+{{- if .Values.monitoring.grafanaDashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slm.fullname" . }}-grafana-dashboards
+  labels:
+    {{- include "slm.labels" . | nindent 4 }}
+    {{ .Values.monitoring.grafanaDashboards.sidecarLabel }}: "1"
+  annotations:
+    grafana_folder: {{ .Values.monitoring.grafanaDashboards.folder | quote }}
+data:
+  {{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}
+{{- end }}

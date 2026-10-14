@@ -1,0 +1,39 @@
+# Staging overlay: applied by .github/workflows/_deploy-env.yml after values.yaml (and optional profile overlays).
+# Adjust hosts, secret-store paths and capacity to your cluster. Secret VALUES never live here.
+config:
+  SLM_ENV: staging
+  SLM_LOG_LEVEL: INFO
+
+ingress:
+  clusterIssuer: letsencrypt-staging
+  api: { host: api.staging.slm.example.com }
+  app: { host: app.staging.slm.example.com }
+
+secrets:
+  externalSecret:
+    data:
+      SLM_DATABASE_URL:    { key: slm-studio/staging/postgres }
+      SLM_REDIS_URL:       { key: slm-studio/staging/redis }
+      SLM_JWT_PRIVATE_KEY: { key: slm-studio/staging/jwt }
+      SLM_JWT_PUBLIC_KEY:  { key: slm-studio/staging/jwt }
+      SLM_S3_ACCESS_KEY:   { key: slm-studio/staging/s3 }
+      SLM_S3_SECRET_KEY:   { key: slm-studio/staging/s3 }
+      SLM_TRAINER_TOKEN:   { key: slm-studio/staging/trainer }
+migration:
+  externalSecret:
+    data:
+      SLM_MIGRATE_DATABASE_URL: { key: slm-studio/staging/postgres, property: migrator_url }
+      SLM_APP_PASSWORD:         { key: slm-studio/staging/postgres, property: app_password }
+
+serviceDefaults:
+  replicas: 1
+services:
+  gateway:
+    replicas: 2
+    pdb: { minAvailable: null, maxUnavailable: 1 }
+    autoscaling: { minReplicas: 2, maxReplicas: 4 }
+  web:
+    replicas: 1
+
+networkPolicy:
+  monitoringNamespace: monitoring
