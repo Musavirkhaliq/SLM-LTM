@@ -21,9 +21,18 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 Schema = Literal["chat", "alpaca", "prompt_completion", "text"]
-DatasetFormat = Literal["jsonl", "csv"]
+DatasetFormat = Literal["jsonl", "csv", "parquet"]
 
 CHAT_ROLES = frozenset({"system", "user", "assistant"})
+ROLE_MAP = {
+    "human": "user",
+    "user": "user",
+    "assistant": "assistant",
+    "gpt": "assistant",
+    "bot": "assistant",
+    "model": "assistant",
+    "system": "system",
+}
 MIN_RECOMMENDED_ROWS = 10
 LONG_ROW_CHARS = 32_000
 CHARS_PER_TOKEN = 4  # rough heuristic used only for the token estimate
@@ -81,8 +90,46 @@ class ValidationReport:
         }
 
 
+def normalize_record(rec: Mapping[str, Any]) -> dict[str, Any]:
+    record = dict(rec)
+    # ShareGPT: conversations -> messages
+    if "conversations" in record and "messages" not in record:
+        convs = record["conversations"]
+        if isinstance(convs, list):
+            mapped_msgs = []
+            for m in convs:
+                if isinstance(m, Mapping):
+                    raw_role = str(m.get("from") or m.get("role") or "").lower()
+                    role = ROLE_MAP.get(raw_role, raw_role)
+                    content = m.get("value") or m.get("content") or ""
+                    mapped_msgs.append({"role": role, "content": str(content)})
+            record["messages"] = mapped_msgs
+    # Prompt + response -> prompt + completion
+    if "prompt" in record and "response" in record and "completion" not in record:
+        record["completion"] = record["response"]
+    # Input + output (without instruction) -> instruction = input
+    if "input" in record and "output" in record and "instruction" not in record:
+        record["instruction"] = record["input"]
+        record["input"] = ""
+    # Instruction + response -> instruction + output
+    if "instruction" in record and "response" in record and "output" not in record:
+        record["output"] = record["response"]
+    # Context -> input (Dolly format)
+    if "context" in record and "input" not in record:
+        record["input"] = record["context"]
+    return record
+
+
 def detect_schema(keys: Iterable[str]) -> Schema | None:
     present = set(keys)
+    if "messages" in present or "conversations" in present:
+        return "chat"
+    if ("instruction" in present and ("output" in present or "response" in present)) or ("input" in present and "output" in present):
+        return "alpaca"
+    if "prompt" in present and ("completion" in present or "response" in present):
+        return "prompt_completion"
+    if "text" in present:
+        return "text"
     for schema in ("chat", "alpaca", "prompt_completion", "text"):
         if set(_REQUIRED[schema]) <= present:  # type: ignore[index]
             return schema  # type: ignore[return-value]
@@ -104,7 +151,8 @@ def _check_messages(messages: Any) -> str | None:
     for i, message in enumerate(messages):
         if not isinstance(message, Mapping):
             return f"messages[{i}] must be an object"
-        role = message.get("role")
+        raw_role = str(message.get("role", "")).lower()
+        role = ROLE_MAP.get(raw_role, raw_role)
         if role not in CHAT_ROLES:
             return f"messages[{i}].role must be one of {sorted(CHAT_ROLES)}"
         if problem := _check_text(message.get("content"), f"messages[{i}].content"):
@@ -114,9 +162,9 @@ def _check_messages(messages: Any) -> str | None:
         if role != "system" and role == previous:
             return f"messages[{i}]: consecutive '{role}' messages"
         previous = role
-    if messages[-1]["role"] != "assistant":
+    if messages[-1]["role"] != "assistant" and messages[-1].get("role") not in ("assistant", "gpt", "model"):
         return "the last message must be from the assistant (it is the training target)"
-    if not any(m["role"] == "user" for m in messages):
+    if not any(ROLE_MAP.get(str(m.get("role", "")).lower(), m.get("role")) == "user" for m in messages):
         return "a conversation needs at least one user message"
     return None
 
@@ -129,7 +177,7 @@ def _check_record(record: Mapping[str, Any], schema: Schema) -> tuple[str | None
     if schema == "chat":
         if problem := _check_messages(record["messages"]):
             return problem, 0
-        return None, sum(len(m["content"]) for m in record["messages"])
+        return None, sum(len(str(m["content"])) for m in record["messages"])
     chars = 0
     for name in _REQUIRED[schema]:
         if problem := _check_text(record[name], name):
@@ -162,6 +210,7 @@ class _Accumulator:
         if not isinstance(record, Mapping):
             self.error(row, "each row must be a JSON object")
             return
+        record = normalize_record(record)
         if r.schema is None:
             r.schema = self._forced or detect_schema(record.keys())
             if r.schema is None:
@@ -280,6 +329,30 @@ def validate_csv(
     return acc.finish()
 
 
+def validate_parquet(
+    content: bytes,
+    *,
+    schema: Schema | None = None,
+    max_errors: int = 100,
+    max_rows: int | None = None,
+) -> ValidationReport:
+    acc = _Accumulator("parquet", max_errors, schema)
+    try:
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(io.BytesIO(content))
+        data = table.to_pylist()
+    except Exception as exc:
+        acc.error(0, f"Failed to read Parquet data: {exc}")
+        return acc.report
+    for row_no, record in enumerate(data, start=1):
+        if max_rows is not None and acc.report.total_rows >= max_rows:
+            acc.report.truncated = True
+            break
+        acc.record(row_no, record)
+    return acc.finish()
+
+
 def validate_dataset(
     content: str | bytes, fmt: DatasetFormat, **options: Any
 ) -> ValidationReport:
@@ -287,4 +360,7 @@ def validate_dataset(
         return validate_jsonl(content, **options)
     if fmt == "csv":
         return validate_csv(content, **options)
+    if fmt == "parquet":
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        return validate_parquet(raw, **options)
     raise ValueError(f"unsupported dataset format '{fmt}'")

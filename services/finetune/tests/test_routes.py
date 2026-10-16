@@ -1,4 +1,5 @@
 import json
+from unittest.mock import AsyncMock, patch
 import uuid
 
 import httpx
@@ -7,8 +8,12 @@ import pytest
 from slm_common.config import BaseServiceSettings
 from slm_common.security import create_access_token
 from slm_finetune.app import create_app
+from slm_finetune.config import FinetuneSettings
 
-SETTINGS = BaseServiceSettings(jwt_secret="finetune-test-secret-finetune-test-1234")
+SETTINGS = FinetuneSettings(
+    jwt_secret="finetune-test-secret-finetune-test-1234",
+    trainer_token="test-trainer-token",
+)
 ID = uuid.uuid4()
 
 
@@ -50,21 +55,6 @@ async def test_probes(client):
     assert (await client.get("/metrics")).status_code == 200
 
 
-async def test_contract_routes_return_501_problem_json(client):
-    cases = [
-        ("GET", "/api/v1/datasets", "viewer", {}),
-        ("GET", "/api/v1/training-jobs", "viewer", {}),
-        ("POST", "/api/v1/training-jobs", "ml_engineer", {"json": job()}),
-        ("GET", f"/api/v1/training-jobs/{ID}", "viewer", {}),
-        ("GET", f"/api/v1/training-jobs/{ID}/metrics", "viewer", {}),
-        ("POST", f"/api/v1/training-jobs/{ID}/cancel", "ml_engineer", {}),
-    ]
-    for method, path, role, kwargs in cases:
-        r = await client.request(method, path, headers=headers(role), **kwargs)
-        assert r.status_code == 501, (path, r.text)
-        assert r.headers["content-type"].startswith("application/problem+json")
-
-
 async def test_rbac(client):
     assert (await client.get("/api/v1/training-jobs")).status_code == 401
     for role in ("viewer", "developer"):
@@ -99,25 +89,43 @@ async def test_training_job_validation(client, mutation):
     assert r.status_code == 422, mutation
 
 
-async def test_valid_training_jobs_reach_the_stub(client):
+async def test_valid_training_jobs_create(client):
     h = headers("ml_engineer")
     for payload in (
         job(),
         job(method="lora", hyperparams={"lora_r": 8, "lora_alpha": 16, "learning_rate": 1e-4}),
         job(method="full", hyperparams={"learning_rate": 1e-5, "epochs": 1}),
     ):
-        assert (await client.post("/api/v1/training-jobs", json=payload, headers=h)).status_code == 501
+        res = await client.post("/api/v1/training-jobs", json=payload, headers=h)
+        assert res.status_code == 201
+        data = res.json()
+        assert data["name"] == "support-tune"
+        assert data["status"] == "queued"
 
 
-async def test_dataset_upload_is_validated_before_the_stub(client):
+async def test_dataset_upload_and_validation(client):
     h = headers("ml_engineer")
-    ok = await client.post(
-        "/api/v1/datasets",
-        data={"name": "support"},
-        files={"file": ("support.jsonl", good_jsonl(), "application/jsonl")},
-        headers=h,
-    )
-    assert ok.status_code == 501  # valid, but storing is not built yet
+    with patch("slm_finetune.routes.upload_bytes", new=AsyncMock(return_value="s3://datasets/test.jsonl")):
+        ok = await client.post(
+            "/api/v1/datasets",
+            data={"name": "support"},
+            files={"file": ("support.jsonl", good_jsonl(), "application/jsonl")},
+            headers=h,
+        )
+        assert ok.status_code == 201
+        ds = ok.json()
+        assert ds["name"] == "support"
+        assert ds["format"] == "jsonl"
+        assert ds["row_count"] == 12
+
+        csv_ok = await client.post(
+            "/api/v1/datasets",
+            data={"name": "csv", "purpose": "eval"},
+            files={"file": ("eval.csv", b"prompt,completion\nhi,hello\n", "text/csv")},
+            headers=h,
+        )
+        assert csv_ok.status_code == 201
+        assert csv_ok.json()["format"] == "csv"
 
     bad = await client.post(
         "/api/v1/datasets",
@@ -128,14 +136,6 @@ async def test_dataset_upload_is_validated_before_the_stub(client):
     assert bad.status_code == 422 and bad.json()["code"] == "invalid_dataset"
     report = bad.json()["report"]
     assert report["error_count"] == 2 and report["errors"][1]["message"] == "invalid JSON"
-
-    csv_ok = await client.post(
-        "/api/v1/datasets",
-        data={"name": "csv", "purpose": "eval"},
-        files={"file": ("eval.csv", b"prompt,completion\nhi,hello\n", "text/csv")},
-        headers=h,
-    )
-    assert csv_ok.status_code == 501
 
     wrong_type = await client.post(
         "/api/v1/datasets", data={"name": "x"}, files={"file": ("x.parquet", b"PAR1", "application/octet-stream")}, headers=h
@@ -152,3 +152,26 @@ async def test_dataset_upload_is_validated_before_the_stub(client):
         headers=h,
     )
     assert bad_purpose.status_code == 422
+
+
+async def test_internal_callbacks_auth(client):
+    job_id = uuid.uuid4()
+    # No auth header -> 401
+    res = await client.post(f"/internal/v1/training-jobs/{job_id}/metrics", json={"step": 1, "loss": 0.5})
+    assert res.status_code == 401
+
+    # Bad token -> 401
+    res = await client.post(
+        f"/internal/v1/training-jobs/{job_id}/metrics",
+        json={"step": 1, "loss": 0.5},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert res.status_code == 401
+
+    # Good token -> 200
+    res = await client.post(
+        f"/internal/v1/training-jobs/{job_id}/metrics",
+        json={"step": 1, "loss": 0.5},
+        headers={"Authorization": f"Bearer {SETTINGS.trainer_token}"},
+    )
+    assert res.status_code == 200

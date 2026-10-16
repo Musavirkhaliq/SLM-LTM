@@ -504,4 +504,15 @@ export interface ApiProblem {
   status?: number;
   detail?: string;
   error?: { message: string; type?: string; code?: string };
+  report?: {
+    format?: string;
+    schema?: string | null;
+    ok?: boolean;
+    total_rows?: number;
+    valid_rows?: number;
+    error_count?: number;
+    errors?: Array<{ row: number; message: string }>;
+    warnings?: string[];
+  };
+  extra?: Record<string, unknown>;
 }

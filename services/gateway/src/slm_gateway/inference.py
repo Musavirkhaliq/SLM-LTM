@@ -258,7 +258,7 @@ class _Call:
         return StreamingResponse(
             self._relay(target, upstream),
             media_type="text/event-stream",
-            headers=headers | {"cache-control": "no-cache", "x-accel-buffering": "no"},
+            headers=headers | {"cache-control": "no-cache, no-transform", "x-accel-buffering": "no"},
         )
 
     async def _relay(self, target: Target, upstream: httpx.Response):

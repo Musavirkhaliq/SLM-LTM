@@ -58,7 +58,7 @@ class Limiter:
 
         # The per-key limit (if any) is checked first so rejected requests do not eat org budget.
         checks: list[tuple[str, int]] = []
-        if key.rate_limit_rpm is not None:
+        if key.key_id is not None and key.rate_limit_rpm is not None:
             checks.append((f"slm:rpm:key:{key.key_id}", key.rate_limit_rpm))
         checks.append((f"slm:rpm:org:{key.org_id}", key.rpm_limit))
         req_limit, req_remaining = key.rpm_limit, key.rpm_limit

@@ -9,9 +9,10 @@ from uuid import UUID
 
 import asyncpg
 
+from slm_common.config import BaseServiceSettings
 from slm_common.db import tenant_tx
 from slm_common.errors import ApiError
-from slm_common.security import API_KEY_CACHE_PREFIX, hash_api_key, looks_like_api_key
+from slm_common.security import API_KEY_CACHE_PREFIX, decode_token, hash_api_key, looks_like_api_key
 from slm_gateway.store import Store
 
 _NEGATIVE = "null"
@@ -28,7 +29,7 @@ WHERE k.key_hash = $1
 
 @dataclass(frozen=True, slots=True)
 class KeyInfo:
-    key_id: UUID
+    key_id: UUID | None
     org_id: UUID
     project_id: UUID | None
     scope: str
@@ -56,7 +57,8 @@ class KeyInfo:
 
     def to_json(self) -> str:
         data = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in asdict(self).items()}
-        data["key_id"], data["org_id"] = str(self.key_id), str(self.org_id)
+        data["key_id"] = str(self.key_id) if self.key_id else None
+        data["org_id"] = str(self.org_id)
         data["project_id"] = str(self.project_id) if self.project_id else None
         return json.dumps(data)
 
@@ -65,7 +67,8 @@ class KeyInfo:
         d = json.loads(raw)
         for field in ("expires_at", "grace_until", "revoked_at"):
             d[field] = datetime.fromisoformat(d[field]) if d[field] else None
-        d["key_id"], d["org_id"] = UUID(d["key_id"]), UUID(d["org_id"])
+        d["key_id"] = UUID(d["key_id"]) if d["key_id"] else None
+        d["org_id"] = UUID(d["org_id"])
         d["project_id"] = UUID(d["project_id"]) if d["project_id"] else None
         return cls(**d)
 
@@ -76,12 +79,19 @@ def _auth_error(code: str, message: str) -> ApiError:
 
 class KeyAuthenticator:
     def __init__(
-        self, pool: asyncpg.Pool, store: Store, *, ttl: float = 60.0, negative_ttl: float = 5.0
+        self,
+        pool: asyncpg.Pool,
+        store: Store,
+        *,
+        ttl: float = 60.0,
+        negative_ttl: float = 5.0,
+        settings: BaseServiceSettings | None = None,
     ) -> None:
         self._pool = pool
         self._store = store
         self._ttl = ttl
         self._negative_ttl = negative_ttl
+        self._settings = settings
 
     async def authenticate(self, authorization: str | None) -> KeyInfo:
         scheme, _, token = (authorization or "").partition(" ")
@@ -91,15 +101,70 @@ class KeyAuthenticator:
                 "missing_api_key",
                 "You must provide an API key as 'Authorization: Bearer slm_...'.",
             )
-        if not looks_like_api_key(token):  # malformed keys never reach the cache or the DB
+        if looks_like_api_key(token):
+            digest = hash_api_key(token)
+            info = await self._load(digest)
+            if info is None:
+                raise _auth_error("invalid_api_key", "Incorrect API key provided.")
+            if (problem := info.rejection()) is not None:
+                raise problem
+            return info
+
+        # Fallback: check if this is a user session JWT (e.g. from the web playground)
+        try:
+            claims = decode_token(token, self._settings)
+        except Exception:
             raise _auth_error("invalid_api_key", "Incorrect API key provided.")
-        digest = hash_api_key(token)
-        info = await self._load(digest)
-        if info is None:
-            raise _auth_error("invalid_api_key", "Incorrect API key provided.")
-        if (problem := info.rejection()) is not None:
-            raise problem
-        return info
+
+        org_id_str = claims.get("org")
+        org_id: UUID | None = None
+        if org_id_str:
+            try:
+                org_id = UUID(org_id_str)
+            except ValueError:
+                org_id = None
+
+        if org_id is None:
+            user_id = claims.get("sub")
+            if user_id:
+                async with tenant_tx(self._pool, None, bypass=True) as conn:
+                    row = await conn.fetchrow(
+                        "SELECT org_id FROM org_memberships WHERE user_id = $1 ORDER BY created_at LIMIT 1",
+                        UUID(user_id) if isinstance(user_id, str) else user_id,
+                    )
+                    if row:
+                        org_id = row["org_id"]
+
+        if org_id is None:
+            raise _auth_error("invalid_api_key", "User has no active organization.")
+
+        exp = claims.get("exp")
+        expires_at = datetime.fromtimestamp(exp, tz=UTC) if exp else None
+
+        # Look up org quota if available
+        async with tenant_tx(self._pool, None, bypass=True) as conn:
+            q_row = await conn.fetchrow(
+                "SELECT rpm_limit, tpm_limit, monthly_token_limit FROM quotas WHERE org_id = $1",
+                org_id,
+            )
+
+        rpm_limit = q_row["rpm_limit"] if q_row and q_row["rpm_limit"] is not None else 600
+        tpm_limit = q_row["tpm_limit"] if q_row and q_row["tpm_limit"] is not None else 200_000
+        monthly_limit = q_row["monthly_token_limit"] if q_row else None
+
+        return KeyInfo(
+            key_id=None,
+            org_id=org_id,
+            project_id=None,
+            scope="all",
+            rate_limit_rpm=None,
+            rpm_limit=rpm_limit,
+            tpm_limit=tpm_limit,
+            monthly_token_limit=monthly_limit,
+            expires_at=expires_at,
+            grace_until=None,
+            revoked_at=None,
+        )
 
     async def _load(self, digest: bytes) -> KeyInfo | None:
         cache_key = API_KEY_CACHE_PREFIX + digest.hex()

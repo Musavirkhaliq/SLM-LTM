@@ -10,6 +10,7 @@ MetricName = Literal[
     "accuracy",
     "f1",
     "rouge",
+    "rouge_l",
     "bleu",
     "hallucination",
     "faithfulness",
@@ -46,35 +47,42 @@ class EvaluationCreate(BaseModel):
 class EvaluationOut(BaseModel):
     id: UUID
     org_id: UUID
-    project_id: UUID | None
+    project_id: UUID | None = None
     name: str
     dataset_id: UUID
     model_version_ids: list[UUID]
     metrics: list[MetricName]
-    judge_model: str | None
+    judge_model: str | None = None
     status: JobStatus
     created_at: datetime
-    finished_at: datetime | None
+    finished_at: datetime | None = None
+    dataset_name: str | None = None
+    error: str | None = None
 
 
 class ResultOut(BaseModel):
+    evaluation_id: UUID | None = None
     model_version_id: UUID
     scores: dict[str, float]
-    latency_p50_ms: int | None
-    latency_p95_ms: int | None
-    cost_per_1k_tokens_usd: float | None
-    sample_count: int | None
+    latency_p50_ms: int | None = None
+    latency_p95_ms: int | None = None
+    cost_per_1k_tokens_usd: float | None = None
+    sample_count: int | None = None
+    model_name: str | None = None
+    model_version: int | None = None
 
 
 class ResultsOut(BaseModel):
     evaluation_id: UUID
     status: JobStatus
-    results: list[ResultOut]
+    results: list[ResultOut] = Field(default_factory=list)
+    items: list[ResultOut] = Field(default_factory=list)
 
 
 class ComparisonOut(BaseModel):
-    evaluation_ids: list[UUID]
-    metrics: dict[str, dict[str, Any]]
+    evaluation_ids: list[UUID] = Field(default_factory=list)
+    metrics: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    items: list[ResultOut] = Field(default_factory=list)
 
 
 def parse_ids(raw: str) -> list[UUID]:

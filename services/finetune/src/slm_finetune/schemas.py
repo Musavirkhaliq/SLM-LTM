@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Self
+from typing import Any, Literal, Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -59,22 +59,30 @@ class TrainingJobOut(BaseModel):
     hyperparams: dict
     gpu_count: int
     status: JobStatus
-    output_version_id: UUID | None
-    tokens_processed: int
-    est_cost_usd: float | None
-    error: str | None
+    output_version_id: UUID | None = None
+    tokens_processed: int = 0
+    est_cost_usd: float | None = None
+    error: str | None = None
     created_at: datetime
-    started_at: datetime | None
-    finished_at: datetime | None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+    # UI convenience fields:
+    base_model_name: str | None = None
+    dataset_name: str | None = None
+    current_step: int | None = None
+    total_steps: int | None = None
+    total_tokens: int | None = None
+    cost_so_far_usd: float | None = None
 
 
 class MetricPoint(BaseModel):
     step: int
-    loss: float | None
-    eval_loss: float | None
-    lr: float | None
-    tokens: int | None
-    gpu_util: float | None
+    loss: float | None = None
+    eval_loss: float | None = None
+    lr: float | None = None
+    tokens: int | None = None
+    gpu_util: float | None = None
     recorded_at: datetime
 
 
@@ -91,3 +99,26 @@ class DatasetOut(BaseModel):
     size_bytes: int | None
     schema_info: dict
     created_at: datetime
+
+
+class TrainerMetricUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    step: int
+    loss: float | None = None
+    eval_loss: float | None = None
+    lr: float | None = None
+    tokens: int | None = None
+    gpu_util: float | None = None
+
+
+class TrainerStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: JobStatus
+    mlflow_run_id: str | None = None
+    tokens_processed: int | None = None
+    error: str | None = None
+    artifact_uri: str | None = None
+    merged_uri: str | None = None
+    final_loss: float | None = None

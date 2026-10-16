@@ -11,7 +11,8 @@ SELECT m.id, m.org_id, CASE WHEN m.org_id IS NULL THEN 'global' ELSE 'org' END A
        m.name, m.family, m.description, m.license, m.source::text AS source, m.hf_repo,
        m.created_by, m.created_at, m.updated_at, m.archived_at,
        (SELECT v.version FROM model_versions v
-         WHERE v.model_id = m.id AND v.status = 'active') AS active_version,
+         WHERE v.model_id = m.id AND v.status = 'active'
+         ORDER BY v.version DESC LIMIT 1) AS active_version,
        (SELECT count(*)::int FROM model_versions v WHERE v.model_id = m.id) AS version_count
 FROM models m
 """
@@ -219,3 +220,35 @@ async def visible(conn: asyncpg.Connection, table: str, row_id: UUID) -> bool:
     """Existence check under the caller's RLS context (FKs themselves ignore RLS)."""
     assert table in {"model_versions", "training_jobs"}
     return bool(await conn.fetchval(f"SELECT 1 FROM {table} WHERE id = $1", row_id))
+
+
+async def get_latest_versions_for_models(
+    conn: asyncpg.Connection, model_ids: list[UUID]
+) -> dict[UUID, asyncpg.Record]:
+    if not model_ids:
+        return {}
+    rows = await conn.fetch(
+        f"""
+        SELECT DISTINCT ON (model_id) {VERSION_COLS}
+        FROM model_versions
+        WHERE model_id = ANY($1) AND status != 'archived'
+        ORDER BY model_id, (status = 'active') DESC, version DESC
+        """,
+        model_ids,
+    )
+    return {r["model_id"]: r for r in rows}
+
+
+async def get_latest_version_for_model(
+    conn: asyncpg.Connection, model_id: UUID
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        f"""
+        SELECT {VERSION_COLS}
+        FROM model_versions
+        WHERE model_id = $1 AND status != 'archived'
+        ORDER BY (status = 'active') DESC, version DESC
+        LIMIT 1
+        """,
+        model_id,
+    )

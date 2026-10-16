@@ -45,6 +45,7 @@ def build_gateway(
             store,
             ttl=settings.api_key_cache_ttl_seconds,
             negative_ttl=settings.api_key_negative_cache_seconds,
+            settings=settings,
         ),
         limiter=Limiter(store, pool),
         router=router or Router(pool, ttl=settings.route_cache_ttl_seconds),
@@ -88,7 +89,7 @@ def create_app(
             limits=httpx.Limits(max_connections=1000, max_keepalive_connections=200),
         )
         the_control = control_http or httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=5.0), follow_redirects=False
+            timeout=httpx.Timeout(300.0, connect=10.0), follow_redirects=False
         )
         gateway = build_gateway(settings, the_pool, the_store, the_inference, the_control, router)
         app.state.pool = the_pool
@@ -108,7 +109,16 @@ def create_app(
             if owned["pool"]:
                 await the_pool.close()
 
+    from starlette.middleware.cors import CORSMiddleware
+
     app = create_base_app("gateway", settings=settings, lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     for exc_type in (ApiError, RequestValidationError, StarletteHTTPException, Exception):
         app.add_exception_handler(exc_type, _by_path_handler)
 

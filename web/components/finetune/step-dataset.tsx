@@ -28,9 +28,9 @@ export function StepDataset({ datasetId, onSelect }: { datasetId: string | null;
       setFileError(`Unsupported file type “${ext}”. Use JSONL, CSV or Parquet.`);
       return;
     }
-    if (f.size > 2 * 1024 * 1024 * 1024) {
+    if (f.size > 200 * 1024 * 1024) {
       setFile(null);
-      setFileError("Files larger than 2 GB must be uploaded through object storage.");
+      setFileError("Files larger than 200 MB must be uploaded through object storage.");
       return;
     }
     setFileError(null);
@@ -44,8 +44,18 @@ export function StepDataset({ datasetId, onSelect }: { datasetId: string | null;
       toast.success(`Uploaded ${ds.name}`, { description: `${formatNumber(ds.row_count ?? 0)} rows detected` });
       setFile(null);
       onSelect(ds.id);
-    } catch (e) {
-      setFileError(e instanceof Error ? e.message : "Upload failed");
+    } catch (e: unknown) {
+      let msg = e instanceof Error ? e.message : "Upload failed";
+      const prob =
+        e && typeof e === "object" && "problem" in e
+          ? (e as { problem?: { report?: { errors?: Array<{ row: number; message: string }> }; extra?: { report?: { errors?: Array<{ row: number; message: string }> } } } }).problem
+          : undefined;
+      const reportErrors = prob?.report?.errors ?? prob?.extra?.report?.errors;
+      if (Array.isArray(reportErrors) && reportErrors.length > 0) {
+        const topErrors = reportErrors.slice(0, 3).map((err) => `Line ${err.row}: ${err.message}`).join(" · ");
+        msg = `${msg} (${topErrors})`;
+      }
+      setFileError(msg);
     }
   }
 
@@ -58,9 +68,9 @@ export function StepDataset({ datasetId, onSelect }: { datasetId: string | null;
           Upload a new dataset
         </h3>
         <p className="mb-3 mt-1 text-xs text-muted-foreground">
-          Chat-format JSONL (<code className="font-mono">{"{\"messages\": [...]}"}</code>), or CSV/Parquet with prompt and completion columns.
+          JSONL, CSV, or Parquet. Formats: Chat (<code className="font-mono">messages</code> or <code className="font-mono">conversations</code>), Alpaca (<code className="font-mono">instruction</code>, <code className="font-mono">output</code>), or Prompt-Completion (<code className="font-mono">prompt</code>, <code className="font-mono">completion</code>).
         </p>
-        <FileDrop id="dataset-file" accept={ACCEPTED.join(",")} onFiles={pick} hint="JSONL, CSV or Parquet · up to 2 GB" title="Drop a dataset or click to browse" />
+        <FileDrop id="dataset-file" accept={ACCEPTED.join(",")} onFiles={pick} hint="JSONL, CSV or Parquet · up to 200 MB" title="Drop a dataset or click to browse" />
         {file && (
           <div className="mt-3 space-y-3">
             <FileChip file={file} onClear={() => setFile(null)} />

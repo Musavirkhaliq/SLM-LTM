@@ -34,24 +34,6 @@ class ModelPatchIn(BaseModel):
     hf_repo: str | None = Field(default=None, max_length=256)
 
 
-class ModelOut(BaseModel):
-    id: UUID
-    org_id: UUID | None
-    scope: ModelScope
-    name: str
-    family: str | None
-    description: str | None
-    license: str | None
-    source: ModelSource
-    hf_repo: str | None
-    created_by: UUID | None
-    created_at: datetime
-    updated_at: datetime
-    archived_at: datetime | None
-    active_version: int | None
-    version_count: int
-
-
 class VersionCreateIn(BaseModel):
     format: ModelFormat = "hf"
     param_count: int | None = Field(default=None, ge=0)
@@ -96,3 +78,22 @@ class VersionOut(BaseModel):
     metadata: dict[str, Any]
     created_by: UUID | None
     created_at: datetime
+
+
+class ModelOut(BaseModel):
+    id: UUID
+    org_id: UUID | None
+    scope: ModelScope
+    name: str
+    family: str | None
+    description: str | None
+    license: str | None
+    source: ModelSource
+    hf_repo: str | None
+    created_by: UUID | None
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None
+    active_version: int | None
+    version_count: int
+    latest_version: VersionOut | None = None

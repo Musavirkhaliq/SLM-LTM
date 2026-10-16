@@ -42,24 +42,23 @@ async def test_probes(client):
     assert (await client.get("/metrics")).status_code == 200
 
 
-async def test_routes_exist_and_return_501_problem_json(client):
+async def test_routes_implemented(client):
     cases = [
-        ("GET", "/api/v1/evaluations", "viewer", None),
-        ("POST", "/api/v1/evaluations", "ml_engineer", body()),
-        ("GET", f"/api/v1/evaluations/{A}/results", "viewer", None),
-        ("GET", f"/api/v1/evaluations/compare?ids={A},{B}", "viewer", None),
+        ("GET", "/api/v1/evaluations", "viewer", None, 200),
+        ("POST", "/api/v1/evaluations", "ml_engineer", body(), 201),
+        ("GET", f"/api/v1/evaluations/{A}/results", "viewer", None, 200),
+        ("GET", f"/api/v1/evaluations/compare?ids={A},{B}", "viewer", None, 200),
     ]
-    for method, path, role, payload in cases:
+    for method, path, role, payload, expected_status in cases:
         r = await client.request(method, path, json=payload, headers=headers(role))
-        assert r.status_code == 501, path
-        assert r.headers["content-type"].startswith("application/problem+json")
+        assert r.status_code == expected_status, f"{path}: {r.text}"
 
 
 async def test_rbac(client):
     assert (await client.get("/api/v1/evaluations")).status_code == 401
     r = await client.post("/api/v1/evaluations", json=body(), headers=headers("developer"))
     assert r.status_code == 403
-    assert (await client.get("/api/v1/evaluations", headers=headers("viewer"))).status_code == 501
+    assert (await client.get("/api/v1/evaluations", headers=headers("viewer"))).status_code == 200
 
 
 @pytest.mark.parametrize(
@@ -88,7 +87,16 @@ async def test_llm_judged_metrics_accepted_with_judge(client):
         json=body(metrics=["faithfulness", "json_validity"], judge_model="llama-3.1-8b"),
         headers=headers("ml_engineer"),
     )
-    assert r.status_code == 501
+    assert r.status_code == 201
+
+
+async def test_rouge_l_accepted(client):
+    r = await client.post(
+        "/api/v1/evaluations",
+        json=body(metrics=["accuracy", "rouge_l"]),
+        headers=headers("ml_engineer"),
+    )
+    assert r.status_code == 201
 
 
 @pytest.mark.parametrize(

@@ -45,7 +45,12 @@ export function EvaluateDialog({
   const [datasetId, setDatasetId] = React.useState("");
   const [compareWith, setCompareWith] = React.useState(NONE);
   const [metrics, setMetrics] = React.useState<string[]>(["accuracy", "f1", "faithfulness"]);
+  const [judgeModel, setJudgeModel] = React.useState<string>("llama-3.1-8b");
   const [error, setError] = React.useState<string | null>(null);
+
+  const hasJudgedMetrics = metrics.some((m) =>
+    ["faithfulness", "groundedness", "hallucination", "toxicity"].includes(m)
+  );
 
   React.useEffect(() => {
     if (open) {
@@ -73,10 +78,22 @@ export function EvaluateDialog({
     if (!name.trim()) return setError("Give the evaluation a name.");
     if (!datasetId) return setError("Choose an evaluation dataset.");
     if (!metrics.length) return setError("Select at least one metric.");
+    if (hasJudgedMetrics && !judgeModel.trim()) {
+      return setError("Please specify a judge model for LLM-evaluated metrics.");
+    }
     const other = models.data?.find((m) => m.id === compareWith)?.latest_version?.id;
     try {
-      await create.mutateAsync({ name: name.trim(), dataset_id: datasetId, model_version_ids: other ? [baseVersion, other] : [baseVersion], metrics });
-      toast.success("Evaluation queued", { description: "Track progress on the Evaluation page.", action: { label: "Open", onClick: () => router.push("/evaluation") } });
+      await create.mutateAsync({
+        name: name.trim(),
+        dataset_id: datasetId,
+        model_version_ids: other ? [baseVersion, other] : [baseVersion],
+        metrics,
+        judge_model: hasJudgedMetrics ? judgeModel.trim() : undefined,
+      });
+      toast.success("Evaluation queued", {
+        description: "Track progress on the Evaluation page.",
+        action: { label: "Open", onClick: () => router.push("/evaluation") },
+      });
       onOpenChange(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not start the evaluation");
@@ -157,6 +174,20 @@ export function EvaluateDialog({
               ))}
             </div>
           </fieldset>
+          {hasJudgedMetrics && (
+            <Field
+              label="Judge Model"
+              htmlFor="ev-judge"
+              hint="Required for LLM-judged metrics (faithfulness, groundedness, hallucination, toxicity)."
+            >
+              <Input
+                id="ev-judge"
+                placeholder="e.g. llama-3.1-8b, qwen2.5-7b"
+                value={judgeModel}
+                onChange={(e) => setJudgeModel(e.target.value)}
+              />
+            </Field>
+          )}
           {error && (
             <p role="alert" className="text-sm text-destructive">
               {error}

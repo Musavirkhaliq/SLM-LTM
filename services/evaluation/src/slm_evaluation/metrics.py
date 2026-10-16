@@ -205,7 +205,7 @@ def json_validity(
 
 # ---------------------------------------------------------------- registry --
 _LLM_JUDGED = {"hallucination", "faithfulness", "groundedness", "toxicity"}
-SUPPORTED_METRICS = ("accuracy", "f1", "rouge", "bleu", "json_validity")
+SUPPORTED_METRICS = ("accuracy", "f1", "rouge", "rouge_l", "bleu", "json_validity")
 
 
 def compute_metrics(
@@ -232,7 +232,7 @@ def compute_metrics(
             scores[name] = accuracy(predictions, single)
         elif name == "f1":
             scores[name] = mean_token_f1(predictions, single)
-        elif name == "rouge":
+        elif name in ("rouge", "rouge_l"):
             scores[name] = mean_rouge_l(predictions, single)
         else:
             scores[name] = corpus_bleu(predictions, references, **_pick(options, "max_n", "smooth"))

@@ -490,6 +490,7 @@ CREATE POLICY audit_read   ON audit_logs FOR SELECT USING (rls_bypass() OR org_i
 CREATE POLICY audit_insert ON audit_logs FOR INSERT WITH CHECK (true);
 
 -- ------------------------------------------------------- seed catalogue ----
+SET LOCAL app.bypass_rls = 'on';
 INSERT INTO models (org_id, name, family, license, source, hf_repo, description) VALUES
   (NULL, 'phi-4',           'phi',     'MIT',        'huggingface', 'microsoft/phi-4',                'Microsoft Phi-4 (14B)'),
   (NULL, 'phi-4-mini',      'phi',     'MIT',        'huggingface', 'microsoft/Phi-4-mini-instruct',  'Microsoft Phi-4 Mini (3.8B)'),

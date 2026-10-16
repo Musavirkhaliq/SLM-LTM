@@ -39,8 +39,11 @@ def _pool(request: Request) -> asyncpg.Pool:
     return request.app.state.pool
 
 
-def _model(row) -> ModelOut:
-    return ModelOut.model_validate(dict(row))
+def _model(row, latest_version=None) -> ModelOut:
+    data = dict(row)
+    if latest_version is not None:
+        data["latest_version"] = _version(latest_version)
+    return ModelOut.model_validate(data)
 
 
 def _version(row) -> VersionOut:
@@ -100,8 +103,10 @@ async def list_models(
             query=q,
             include_archived=include_archived,
         )
+        model_ids = [r["id"] for r in rows]
+        latest_versions = await repo.get_latest_versions_for_models(conn, model_ids)
     result = build_page(rows, page.limit, lambda r: {"ts": r["created_at"], "id": r["id"]})
-    result["items"] = [_model(r) for r in result["items"]]
+    result["items"] = [_model(r, latest_versions.get(r["id"])) for r in result["items"]]
     return result
 
 
@@ -144,9 +149,10 @@ async def get_model(
 ):
     async with tenant_tx(_pool(request), principal.require_org()) as conn:
         row = await repo.get_model(conn, model_id)
+        latest_v = await repo.get_latest_version_for_model(conn, model_id) if row else None
     if row is None:
         raise ApiError.not_found("model")
-    return _model(row)
+    return _model(row, latest_v)
 
 
 @router.patch("/{model_id}", response_model=ModelOut)

@@ -1,12 +1,11 @@
 # Trainer image dependencies. Ranges, not exact pins, because Unsloth tightly couples to
 # torch/transformers/trl versions: let the resolver pick a consistent set, then FREEZE the result
 # for releases:   uv pip compile requirements.txt -o requirements.lock  (then install the .lock).
-# torch is resolved from the CUDA 12.8 index (see Dockerfile.trainer --extra-index-url).
-torch>=2.6,<2.9
+# torch is provided by base image when USE_SYSTEM_TORCH=1
 unsloth>=2025.3
-transformers>=4.51,<5
-peft>=0.14,<1
-trl>=0.15,<1
+transformers>=4.48
+peft>=0.14
+trl>=0.15
 accelerate>=1.2
 bitsandbytes>=0.45
 datasets>=3.2

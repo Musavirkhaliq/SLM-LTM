@@ -234,9 +234,12 @@ def to_text_fn(tokenizer):
         if ex.get("prompt") is not None and (ex.get("completion") is not None or ex.get("response") is not None):
             return {"text": render([{"role": "user", "content": ex["prompt"]},
                                     {"role": "assistant", "content": ex.get("completion") or ex.get("response")}])}
-        if ex.get("instruction") is not None and ex.get("output") is not None:  # alpaca
-            user = ex["instruction"] + (f"\n\n{ex['input']}" if ex.get("input") else "")
-            return {"text": render([{"role": "user", "content": user}, {"role": "assistant", "content": ex["output"]}])}
+        instruction = ex.get("instruction") if ex.get("instruction") is not None else ex.get("input")
+        output = ex.get("output") if ex.get("output") is not None else ex.get("response")
+        if instruction is not None and output is not None:  # alpaca / dolly / instruct-response
+            context = ex.get("context") or (ex.get("input") if ex.get("instruction") is not None else None)
+            user = instruction + (f"\n\n{context}" if context else "")
+            return {"text": render([{"role": "user", "content": user}, {"role": "assistant", "content": output}])}
         if ex.get("text"):
             return {"text": ex["text"]}
         raise SpecError("dataset rows need one of: messages | prompt+completion | instruction+output | text")
@@ -314,18 +317,52 @@ def run(spec: dict[str, Any], reporter: Reporter) -> dict[str, Any]:
     # --- model + tokenizer ----------------------------------------------------
     model_path = fetch_base_model(spec)
     if method in ("lora", "qlora"):
-        from unsloth import FastLanguageModel  # must be imported before transformers/peft/trl
+        try:
+            from unsloth import FastLanguageModel  # must be imported before transformers/peft/trl
 
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_path, max_seq_length=max_seq_len, dtype=None, load_in_4bit=(method == "qlora"),
-            token=os.environ.get("HF_TOKEN") or None,
-        )
-        model = FastLanguageModel.get_peft_model(
-            model, r=int(hp.get("lora_r", 16)), lora_alpha=int(hp.get("lora_alpha", 32)),
-            lora_dropout=float(hp.get("lora_dropout", 0.0)), bias="none",
-            target_modules=hp.get("target_modules") or ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            use_gradient_checkpointing="unsloth", random_state=seed,
-        )
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_path, max_seq_length=max_seq_len, dtype=None, load_in_4bit=(method == "qlora"),
+                token=os.environ.get("HF_TOKEN") or None,
+            )
+            model = FastLanguageModel.get_peft_model(
+                model, r=int(hp.get("lora_r", 16)), lora_alpha=int(hp.get("lora_alpha", 32)),
+                lora_dropout=float(hp.get("lora_dropout", 0.0)), bias="none",
+                target_modules=hp.get("target_modules") or ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                use_gradient_checkpointing="unsloth", random_state=seed,
+            )
+        except Exception as unsloth_err:
+            log("unsloth_fallback", error=str(unsloth_err))
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            bnb_config = None
+            if method == "qlora":
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                quantization_config=bnb_config,
+                torch_dtype=torch.bfloat16 if method != "qlora" else None,
+                device_map="auto",
+            )
+            if method == "qlora":
+                model = prepare_model_for_kbit_training(model)
+            lora_config = LoraConfig(
+                r=int(hp.get("lora_r", 16)),
+                lora_alpha=int(hp.get("lora_alpha", 32)),
+                lora_dropout=float(hp.get("lora_dropout", 0.0)),
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=hp.get("target_modules") or ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            )
+            model = get_peft_model(model, lora_config)
+            model.gradient_checkpointing_enable()
     else:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -433,7 +470,12 @@ def run(spec: dict[str, Any], reporter: Reporter) -> dict[str, Any]:
     merged_uri = spec["output"].get("merged_uri")
     if merged_uri and method in ("lora", "qlora"):
         merged_dir = out_dir / "merged"
-        model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")  # unsloth API
+        if hasattr(model, "save_pretrained_merged"):
+            model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")  # unsloth API
+        else:
+            merged = model.merge_and_unload()
+            merged.save_pretrained(str(merged_dir))
+            tokenizer.save_pretrained(str(merged_dir))
         s3_upload_dir(spec, merged_dir, merged_uri)
         result["merged_uri"] = merged_uri
     if mlflow_mod:

@@ -94,6 +94,19 @@ async def list_deployments(
     return result
 
 
+async def _resolve_internal_url_and_served_name(
+    conn: asyncpg.Connection, model_version_id: UUID
+) -> tuple[str, str]:
+    row = await conn.fetchrow(
+        "SELECT m.name FROM models m JOIN model_versions mv ON mv.model_id = m.id WHERE mv.id = $1",
+        model_version_id,
+    )
+    name = (row["name"] if row else "").lower()
+    if any(k in name for k in ("qwen", "mistral", "llama", "gemma")):
+        return "http://vllm-qwen:8000", "qwen2.5-7b"
+    return "http://vllm:8000", "phi-4-mini"
+
+
 @router.post("/deployments", response_model=DeploymentOut, status_code=201)
 async def create_deployment(
     body: DeploymentCreate, request: Request, principal: Principal = Operator
@@ -105,6 +118,16 @@ async def create_deployment(
         async with tenant_tx(_pool(request), org_id) as conn:
             if not await repo.model_version_exists(conn, body.model_version_id):
                 raise ApiError.not_found("model version")
+
+            # Automatically resolve default internal_url & served_model_name if not provided
+            if not fields.get("internal_url"):
+                internal_url, served_name = await _resolve_internal_url_and_served_name(
+                    conn, body.model_version_id
+                )
+                fields["internal_url"] = internal_url
+                if "served_model_name" not in fields["vllm_args"]:
+                    fields["vllm_args"]["served_model_name"] = served_name
+
             deployment_id = await repo.insert_deployment(
                 conn, org_id=org_id, created_by=principal.user_id, **fields
             )
@@ -214,12 +237,19 @@ async def start_deployment(
             # Real cluster orchestration (render+apply a StatefulSet/Service) needs a configured
             # Kubernetes client; not wired up in this build. See docs/07-kubernetes-and-docker.md.
             raise ApiError.not_implemented("Kubernetes orchestration")
-        if not deployment["internal_url"]:
-            raise ApiError.conflict(
-                "Set internal_url first (PATCH this deployment) to point at a vLLM server you "
-                "started yourself, e.g. the compose 'vllm' or 'vllm-stub' service",
-                "internal_url_required",
+        internal_url = deployment["internal_url"]
+        vargs = dict(deployment["vllm_args"] or {})
+
+        if not internal_url:
+            internal_url, served_name = await _resolve_internal_url_and_served_name(
+                conn, deployment["model_version_id"]
             )
+            if "served_model_name" not in vargs:
+                vargs["served_model_name"] = served_name
+            await repo.update_deployment(
+                conn, deployment_id, {"internal_url": internal_url, "vllm_args": vargs}
+            )
+
         await repo.update_deployment(conn, deployment_id, {"status": "provisioning"})
         await repo.insert_event(
             conn, org_id=deployment["org_id"], deployment_id=deployment_id, event="provisioning",
@@ -228,8 +258,29 @@ async def start_deployment(
         await repo.update_deployment(conn, deployment_id, {"status": "running"})
         await repo.insert_event(
             conn, org_id=deployment["org_id"], deployment_id=deployment_id, event="started",
-            detail={"internal_url": deployment["internal_url"]}, actor_id=principal.actor_id,
+            detail={"internal_url": internal_url}, actor_id=principal.actor_id,
         )
+
+        # Ensure an active endpoint and route exist for this deployment so Gateway can route traffic
+        alias = deployment["name"].removesuffix("-dep")
+        ep_id = await conn.fetchval(
+            """
+            INSERT INTO endpoints (org_id, alias, kind, enabled)
+            VALUES ($1, $2, 'shared', true)
+            ON CONFLICT (org_id, alias) DO UPDATE SET enabled = true
+            RETURNING id
+            """,
+            deployment["org_id"], alias,
+        )
+        await conn.execute(
+            """
+            INSERT INTO endpoint_routes (endpoint_id, deployment_id, org_id, weight, label)
+            VALUES ($1, $2, $3, 100, 'primary')
+            ON CONFLICT (endpoint_id, deployment_id) DO UPDATE SET weight = 100
+            """,
+            ep_id, deployment_id, deployment["org_id"],
+        )
+
         await audit(
             conn, org_id=deployment["org_id"], actor=principal, action="deployment.start",
             resource="deployment", resource_id=deployment_id, request=request,

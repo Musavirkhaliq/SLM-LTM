@@ -30,6 +30,7 @@ x-slm-env: &slm-env
   SLM_MLFLOW_URI: http://mlflow:5000
   SLM_QDRANT_URL: http://qdrant:6333
   SLM_HF_TOKEN: ${HF_TOKEN:-}
+  SLM_TRAINER_TOKEN: ${SLM_TRAINER_TOKEN:-}
 
 x-service: &service
   restart: unless-stopped
@@ -103,7 +104,7 @@ services:
       retries: 20
 
   minio:
-    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    image: cgr.dev/chainguard/minio:latest
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
@@ -113,13 +114,13 @@ services:
     volumes: [miniodata:/data]
     ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/9000'"]
       interval: 5s
       timeout: 3s
       retries: 20
 
   minio-init:
-    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    image: cgr.dev/chainguard/minio:latest
     restart: "no"
     depends_on:
       minio: { condition: service_healthy }
@@ -239,7 +240,12 @@ services:
     <<: *service
     build: { <<: *build, args: { SERVICE: finetune, PORT: "8003" } }
     image: slm-studio/finetune:${TAG:-dev}
+    ports: ["127.0.0.1:8003:8003"]
     expose: ["8003"]
+    group_add:
+      - "988"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       db-migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
@@ -319,7 +325,7 @@ services:
         # Inlined into the browser bundle at build time: the browser talks to the gateway on localhost.
         # NOTE: the gateway has no CORS middleware yet, so a browser cross-origin call from :3000 to :8000 is
         # blocked unless a same-origin proxy or CORS support is added (ingress-nginx CORS annotations do this on K8s).
-        NEXT_PUBLIC_API_BASE: http://localhost:8000
+        NEXT_PUBLIC_API_BASE: ""
         NEXT_PUBLIC_USE_MOCKS: "false"
     image: slm-studio/web:${TAG:-dev}
     restart: unless-stopped
@@ -332,7 +338,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     depends_on:
       gateway: { condition: service_healthy }
-    ports: ["127.0.0.1:3000:3000"]
+    ports: ["127.0.0.1:${WEB_PORT:-3002}:3000"]
 
   # ------------------------------------------------------------------ inference (optional)
   # CPU-only mock of a vLLM server. Register a deployment whose internal_url is http://vllm-stub:8000.
@@ -370,6 +376,8 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_USE_V1: "0"
+      TORCH_CUDA_ARCH_LIST: "12.0"
     command:
       - --model
       - ${VLLM_MODEL:-microsoft/Phi-4-mini-instruct}
@@ -379,7 +387,7 @@ services:
       - "${VLLM_MAX_MODEL_LEN:-8192}"
       - --gpu-memory-utilization
       - "${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
-      - --enable-prefix-caching
+      - --enforce-eager
     volumes:
       - hfcache:/root/.cache/huggingface
     healthcheck:

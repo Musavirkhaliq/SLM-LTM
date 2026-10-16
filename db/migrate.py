@@ -54,6 +54,7 @@ async def _apply_file(conn: asyncpg.Connection, path: Path) -> None:
     # bookkeeping row commit atomically in one transaction owned by this runner.
     body = _COMMIT_RE.sub("", _BEGIN_RE.sub("", sql, count=1))
     async with conn.transaction():
+        await conn.execute("SET LOCAL app.bypass_rls = 'on'")
         await conn.execute(body)
         await conn.execute(
             "INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)",
@@ -74,7 +75,7 @@ async def ensure_app_role(
             f"CREATE ROLE {r} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS{pw}"
         )
     elif password:
-        await conn.execute(f"ALTER ROLE {r} NOSUPERUSER NOBYPASSRLS{pw}")
+        await conn.execute(f"ALTER ROLE {r} WITH PASSWORD {_quote_literal(password)}")
     db = _quote_ident(await conn.fetchval("SELECT current_database()"))
     await conn.execute(f"GRANT CONNECT ON DATABASE {db} TO {r}")
     await conn.execute(f"GRANT USAGE ON SCHEMA public TO {r}")
