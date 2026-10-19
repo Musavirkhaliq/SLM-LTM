@@ -79,13 +79,13 @@ jobs:
       CHART: deploy/helm/slm-studio
       WEB_IMAGE: ${{ inputs.web_image_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v3.16.3
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@v5
       - name: Configure cluster access
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
