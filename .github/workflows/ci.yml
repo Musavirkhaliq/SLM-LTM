@@ -53,8 +53,8 @@ jobs:
       SLM_TEST_REDIS_URL: redis://localhost:6379/0
       SLM_ENV: dev
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python }}
@@ -85,8 +85,8 @@ jobs:
     env:
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -105,8 +105,8 @@ jobs:
     env:
       CHART: deploy/helm/slm-studio
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
         with:
           version: ${{ env.HELM_VERSION }}
       - name: Install kubeconform (pinned, checksum verified)
@@ -145,7 +145,7 @@ jobs:
             kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
               -schema-location default -schema-location "$CRD_SCHEMAS" "$f"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: rendered-manifests
@@ -157,7 +157,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cp .env.example .env
       - run: docker compose config --quiet
       - run: docker compose --profile stub --profile vllm --profile gpu --profile trainer config --quiet
@@ -167,7 +167,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install hadolint (pinned, checksum verified)
         run: |
           set -euo pipefail
@@ -197,9 +197,9 @@ jobs:
           - { image: gateway, file: Dockerfile.service, args: "SERVICE=gateway\nPORT=8000" }
           - { image: web, file: Dockerfile.web, args: "NEXT_PUBLIC_USE_MOCKS=false" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/docker/${{ matrix.file }}
@@ -214,9 +214,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Vulnerabilities + secrets in the repo (uv.lock, package-lock.json, ...) - blocking on HIGH/CRITICAL
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -226,7 +226,7 @@ jobs:
           exit-code: "1"
           skip-dirs: web/node_modules,.venv
       - name: IaC / Dockerfile misconfiguration (informational, not blocking)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: deploy
@@ -238,7 +238,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Install gitleaks (pinned, checksum verified)
