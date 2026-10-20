@@ -1,6 +1,6 @@
 # DEV ONLY (docker compose): MLflow tracking server with Postgres backend store and S3/MinIO artifacts.
 # Production uses a managed/self-hosted MLflow outside this chart (set config.SLM_MLFLOW_URI).
-FROM python:3.12.8-slim-bookworm
+FROM python:3.15.0-slim-bookworm
 ARG MLFLOW_VERSION=2.17.2
 RUN pip install --no-cache-dir "mlflow==${MLFLOW_VERSION}" "sqlalchemy<2.1.0" psycopg2-binary==2.9.10 boto3==1.35.90 \
  && groupadd --system --gid 10001 mlflow \
